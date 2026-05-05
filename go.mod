@@ -1,4 +1,4 @@
-module sql-generator
+module github.com/susilo001/sql-generator
 
 go 1.24.1
 

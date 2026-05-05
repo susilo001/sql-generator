@@ -2,7 +2,7 @@ package sql_generator
 
 import (
 	"fmt"
-	"sql-generator/model"
+	"github.com/susilo001/sql-generator/model"
 	"strings"
 
 	"gorm.io/gorm"

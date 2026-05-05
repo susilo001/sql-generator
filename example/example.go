@@ -3,8 +3,8 @@ package main
 import (
 	"fmt"
 	"log"
-	"sql-generator"
-	"sql-generator/model"
+	"github.com/susilo001/sql-generator"
+	"github.com/susilo001/sql-generator/model"
 
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"

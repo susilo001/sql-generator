@@ -1,7 +1,7 @@
 package sql_generator
 
 import (
-	"sql-generator/model"
+	"github.com/susilo001/sql-generator/model"
 	"testing"
 
 	"gorm.io/gorm"

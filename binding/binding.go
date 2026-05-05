@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"io"
 
-	"sql-generator/model"
+	"github.com/susilo001/sql-generator/model"
 )
 
 // ParseBody decodes a JSON request body from r into a model.Query.

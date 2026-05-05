@@ -15,9 +15,9 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"gorm.io/gorm"
 
-	sqlgenerator "sql-generator"
-	"sql-generator/binding"
-	"sql-generator/model"
+	sqlgenerator "github.com/susilo001/sql-generator"
+	"github.com/susilo001/sql-generator/binding"
+	"github.com/susilo001/sql-generator/model"
 )
 
 // --- Shared setup ----------------------------------------------------------
