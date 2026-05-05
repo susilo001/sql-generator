@@ -1,6 +1,6 @@
 package model
 
 type Pagination struct {
-	Page     int
-	PageSize int
+	Page     int `json:"page"`
+	PageSize int `json:"page_size"`
 }

@@ -1,16 +1,16 @@
 package model
 
 type Filter struct {
-	FieldName   string
-	Operator    Operator
-	Condition   Condition
-	Value       any
-	Value2      any
-	RangeValues []any
+	FieldName   string    `json:"field_name"`
+	Operator    Operator  `json:"operator"`
+	Condition   Condition `json:"condition"`
+	Value       any       `json:"value"`
+	Value2      any       `json:"value2"`
+	RangeValues []any     `json:"range_values"`
 }
 
 type FilterGroup struct {
-	Condition    Condition     // AND / OR
-	Filters      []Filter      // Individual filters
-	FilterGroups []FilterGroup // Nested groups for complex logic
+	Condition    Condition     `json:"condition"`
+	Filters      []Filter      `json:"filters"`
+	FilterGroups []FilterGroup `json:"filter_groups"`
 }

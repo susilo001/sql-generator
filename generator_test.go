@@ -5,7 +5,18 @@ import (
 	"testing"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
+
+func newTestDB() *gorm.DB {
+	db := &gorm.DB{Config: &gorm.Config{}}
+	db.Statement = &gorm.Statement{
+		DB:      db,
+		Clauses: map[string]clause.Clause{},
+		Vars:    make([]interface{}, 0, 8),
+	}
+	return db
+}
 
 func TestGenerator_FilterScopes_Operators(t *testing.T) {
 	gen := &Generator{
@@ -337,7 +348,7 @@ func TestGenerator_SearchScope_CaseSensitivity(t *testing.T) {
 			}
 
 			scope := gen.searchScope(q)
-			db := &gorm.DB{}
+			db := newTestDB()
 			result := scope(db)
 
 			// In a real test, you'd inspect the generated SQL
@@ -389,7 +400,7 @@ func TestGenerator_JoinScope(t *testing.T) {
 	}
 
 	scope := gen.joinScope(q)
-	db := &gorm.DB{}
+	db := newTestDB()
 	result := scope(db)
 
 	if result == nil {
@@ -427,7 +438,7 @@ func TestGenerator_SelectScope(t *testing.T) {
 	}
 
 	scope := gen.selectScope(q)
-	db := &gorm.DB{}
+	db := newTestDB()
 	result := scope(db)
 
 	if result == nil {
@@ -449,7 +460,7 @@ func TestGenerator_PreloadScope(t *testing.T) {
 	}
 
 	scope := gen.preloadScope(q)
-	db := &gorm.DB{}
+	db := newTestDB()
 	result := scope(db)
 
 	if result == nil {
@@ -485,7 +496,7 @@ func TestGenerator_SoftDeleteScope(t *testing.T) {
 			}
 
 			scope := gen.softDeleteScope(q)
-			db := &gorm.DB{}
+			db := newTestDB()
 			result := scope(db)
 
 			if result == nil {
@@ -507,7 +518,7 @@ func TestGenerator_DistinctScope(t *testing.T) {
 	}
 
 	scope := gen.distinctScope(q)
-	db := &gorm.DB{}
+	db := newTestDB()
 	result := scope(db)
 
 	if result == nil {
@@ -564,7 +575,7 @@ func TestGenerator_PaginationScope(t *testing.T) {
 			}
 
 			scope := gen.paginationScope(q)
-			db := &gorm.DB{}
+			db := newTestDB()
 			result := scope(db)
 
 			if result == nil {

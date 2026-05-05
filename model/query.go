@@ -1,19 +1,19 @@
 package model
 
 type Query struct {
-	Search          string
-	Filter          string
-	Sort            string
-	SelectParameter SelectParameter
-	IncludeDeleted  bool // Include soft-deleted records
-	Distinct        bool // Apply DISTINCT to query
+	Search          string          `json:"search"`
+	Filter          string          `json:"filter"`
+	Sort            string          `json:"sort"`
+	SelectParameter SelectParameter `json:"select_parameter"`
+	IncludeDeleted  bool            `json:"include_deleted"`
+	Distinct        bool            `json:"distinct"`
 }
 
 type SelectParameter struct {
-	Filters        []Filter      // Simple filters (deprecated, use FilterGroups)
-	FilterGroups   []FilterGroup // Complex filter groups with AND/OR logic
-	Sorts          []Sort
-	PageDescriptor Pagination
-	Fields         []string // Field projection (SELECT specific columns)
-	Preloads       []string // Relationships to preload
+	Filters        []Filter    `json:"filters"`
+	FilterGroups   []FilterGroup `json:"filter_groups"`
+	Sorts          []Sort      `json:"sorts"`
+	PageDescriptor Pagination  `json:"page_descriptor"`
+	Fields         []string    `json:"fields"`
+	Preloads       []string    `json:"preloads"`
 }
