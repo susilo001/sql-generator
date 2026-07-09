@@ -1,8 +1,9 @@
 package sql_generator
 
 import (
-	"github.com/susilo001/sql-generator/model"
 	"testing"
+
+	"github.com/susilo001/sql-generator/model"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -236,6 +237,123 @@ func TestGenerator_FilterGroups(t *testing.T) {
 	}
 }
 
+// TestGenerator_FilterGroups_NestedSQL asserts the actual SQL fragment and
+// bound args produced for a nested AND/OR FilterGroup. This is a regression
+// test for a bug where nested groups were applied as independent db.Where
+// calls, silently discarding the nested group's own AND/OR Condition (nested
+// groups always ended up ANDed onto the parent regardless of declared
+// intent).
+func TestGenerator_FilterGroups_NestedSQL(t *testing.T) {
+	gen := &Generator{
+		Schema: &ModelMeta{
+			Fields: map[string]FieldMeta{
+				"role": {
+					Column:    "role",
+					Operators: map[model.Operator]bool{model.IsEqual: true},
+				},
+				"status": {
+					Column:    "status",
+					Operators: map[model.Operator]bool{model.IsEqual: true},
+				},
+				"age": {
+					Column:    "age",
+					Operators: map[model.Operator]bool{model.IsBetween: true},
+				},
+			},
+		},
+	}
+
+	// (role = 'admin' OR role = 'moderator') OR (status = 'active' AND age BETWEEN 18 AND 65)
+	fg := model.FilterGroup{
+		Condition: model.Or,
+		Filters: []model.Filter{
+			{FieldName: "role", Operator: model.IsEqual, Value: "admin"},
+			{FieldName: "role", Operator: model.IsEqual, Value: "moderator"},
+		},
+		FilterGroups: []model.FilterGroup{
+			{
+				Condition: model.And,
+				Filters: []model.Filter{
+					{FieldName: "status", Operator: model.IsEqual, Value: "active"},
+					{FieldName: "age", Operator: model.IsBetween, RangeValues: []any{18, 65}},
+				},
+			},
+		},
+	}
+
+	sql, args, err := gen.buildFilterGroupSQL(fg)
+	if err != nil {
+		t.Fatalf("buildFilterGroupSQL() error = %v", err)
+	}
+
+	wantSQL := "(role = ? OR role = ? OR (status = ? AND age BETWEEN ? AND ?))"
+	if sql != wantSQL {
+		t.Errorf("sql = %q, want %q", sql, wantSQL)
+	}
+
+	wantArgs := []any{"admin", "moderator", "active", 18, 65}
+	if len(args) != len(wantArgs) {
+		t.Fatalf("args = %+v, want %+v", args, wantArgs)
+	}
+	for i := range wantArgs {
+		if args[i] != wantArgs[i] {
+			t.Errorf("args[%d] = %v, want %v", i, args[i], wantArgs[i])
+		}
+	}
+}
+
+// TestGenerator_FilterGroups_UnknownFieldErrors ensures invalid filters
+// inside a group return an error instead of being silently skipped, matching
+// the behavior of top-level filterScopes.
+func TestGenerator_FilterGroups_UnknownFieldErrors(t *testing.T) {
+	gen := &Generator{
+		Schema: &ModelMeta{
+			Fields: map[string]FieldMeta{
+				"status": {
+					Column:    "status",
+					Operators: map[model.Operator]bool{model.IsEqual: true},
+				},
+			},
+		},
+	}
+
+	fg := model.FilterGroup{
+		Condition: model.And,
+		Filters: []model.Filter{
+			{FieldName: "does_not_exist", Operator: model.IsEqual, Value: "x"},
+		},
+	}
+
+	if _, _, err := gen.buildFilterGroupSQL(fg); err == nil {
+		t.Error("expected error for unknown field in FilterGroup, got nil")
+	}
+}
+
+// TestGenerator_FilterGroups_DisallowedOperatorErrors ensures an operator not
+// whitelisted for a field inside a group returns an error.
+func TestGenerator_FilterGroups_DisallowedOperatorErrors(t *testing.T) {
+	gen := &Generator{
+		Schema: &ModelMeta{
+			Fields: map[string]FieldMeta{
+				"status": {
+					Column:    "status",
+					Operators: map[model.Operator]bool{model.IsEqual: true},
+				},
+			},
+		},
+	}
+
+	fg := model.FilterGroup{
+		Filters: []model.Filter{
+			{FieldName: "status", Operator: model.IsMoreThan, Value: 1},
+		},
+	}
+
+	if _, _, err := gen.buildFilterGroupSQL(fg); err == nil {
+		t.Error("expected error for disallowed operator in FilterGroup, got nil")
+	}
+}
+
 func TestGenerator_QueryValidation(t *testing.T) {
 	gen := &Generator{
 		Schema: &ModelMeta{
@@ -460,64 +578,6 @@ func TestGenerator_PreloadScope(t *testing.T) {
 	}
 
 	scope := gen.preloadScope(q)
-	db := newTestDB()
-	result := scope(db)
-
-	if result == nil {
-		t.Error("Expected non-nil result")
-	}
-}
-
-func TestGenerator_SoftDeleteScope(t *testing.T) {
-	tests := []struct {
-		name           string
-		includeDeleted bool
-	}{
-		{
-			name:           "Exclude deleted",
-			includeDeleted: false,
-		},
-		{
-			name:           "Include deleted",
-			includeDeleted: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			gen := &Generator{
-				Schema: &ModelMeta{
-					Fields: map[string]FieldMeta{},
-				},
-			}
-
-			q := model.Query{
-				IncludeDeleted: tt.includeDeleted,
-			}
-
-			scope := gen.softDeleteScope(q)
-			db := newTestDB()
-			result := scope(db)
-
-			if result == nil {
-				t.Error("Expected non-nil result")
-			}
-		})
-	}
-}
-
-func TestGenerator_DistinctScope(t *testing.T) {
-	gen := &Generator{
-		Schema: &ModelMeta{
-			Fields: map[string]FieldMeta{},
-		},
-	}
-
-	q := model.Query{
-		Distinct: true,
-	}
-
-	scope := gen.distinctScope(q)
 	db := newTestDB()
 	result := scope(db)
 

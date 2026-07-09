@@ -1,16 +1,27 @@
+// Command example demonstrates sql-generator end to end: declaring a
+// ModelMeta schema, building queries programmatically, parsing a query
+// straight from an HTTP URL via the binding package, and applying the
+// resulting GORM scopes against a database.
+//
+// Run with a reachable Postgres instance:
+//
+//	go run ./example
 package main
 
 import (
 	"fmt"
 	"log"
-	"github.com/susilo001/sql-generator"
+	"net/http"
+
+	sql_generator "github.com/susilo001/sql-generator"
+	"github.com/susilo001/sql-generator/binding"
 	"github.com/susilo001/sql-generator/model"
 
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
 
-// Example User model
+// User is the example GORM model these queries run against.
 type User struct {
 	ID        uint `gorm:"primaryKey"`
 	Name      string
@@ -25,19 +36,11 @@ func (u User) TableName() string {
 	return "user"
 }
 
-func main() {
-	// Setup database connection
-	dsn := "host=localhost user=myuser password=mypassword dbname=mydb port=5432 sslmode=disable"
-	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
-	if err != nil {
-		log.Fatal("Failed to connect to database:", err)
-	}
-
-	// Auto migrate the schema
-	db.AutoMigrate(&User{})
-
-	// Configure the generator with schema metadata
-	generator := &sql_generator.Generator{
+// newGenerator builds the Generator + ModelMeta schema shared by every
+// example below. In a real project this typically lives once per model,
+// next to the repository that uses it.
+func newGenerator() *sql_generator.Generator {
+	return &sql_generator.Generator{
 		Schema: &sql_generator.ModelMeta{
 			Fields: map[string]sql_generator.FieldMeta{
 				"id": {
@@ -51,7 +54,7 @@ func main() {
 				},
 				"name": {
 					Column:     "name",
-					Searchable: true, // Included in global search
+					Searchable: true, // included in global Search
 					Operators: map[model.Operator]bool{
 						model.IsEqual:     true,
 						model.IsNotEqual:  true,
@@ -67,6 +70,7 @@ func main() {
 						model.IsEqual:     true,
 						model.IsContain:   true,
 						model.IsBeginWith: true,
+						model.IsEndWith:   true,
 					},
 				},
 				"status": {
@@ -111,242 +115,151 @@ func main() {
 			},
 		},
 		DefaultFieldForSort: "id",
-		CaseSensitiveSearch: false, // Use ILIKE for case-insensitive search
-		MaxFiltersPerQuery:  50,    // Limit to 50 filters per query
-		MaxSortsPerQuery:    10,    // Limit to 10 sorts per query
+		CaseSensitiveSearch: false, // ILIKE (Postgres) for case-insensitive search
+		MaxFiltersPerQuery:  50,
+		MaxSortsPerQuery:    10,
+	}
+}
+
+func main() {
+	dsn := "host=localhost user=myuser password=mypassword dbname=mydb port=5432 sslmode=disable"
+	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	if err != nil {
+		log.Fatal("Failed to connect to database:", err)
 	}
 
-	// Example 1: Simple filter query
+	if err := db.AutoMigrate(&User{}); err != nil {
+		log.Fatal("Failed to migrate schema:", err)
+	}
+
+	gen := newGenerator()
+
 	fmt.Println("=== Example 1: Simple Filter ===")
-	simpleQuery := model.Query{
+	executeQuery(db, gen, model.Query{
 		SelectParameter: model.SelectParameter{
 			Filters: []model.Filter{
-				{
-					FieldName: "status",
-					Operator:  model.IsEqual,
-					Value:     "active",
-				},
+				{FieldName: "status", Operator: model.IsEqual, Value: "active"},
 			},
-			PageDescriptor: model.Pagination{
-				Page:     1,
-				PageSize: 10,
-			},
+			PageDescriptor: model.Pagination{Page: 1, PageSize: 10},
 		},
-	}
-	executeQuery(db, generator, simpleQuery)
+	})
 
-	// Example 2: Complex filter with AND/OR groups
-	fmt.Println("\n=== Example 2: Complex Filter Groups ===")
-	complexQuery := model.Query{
+	fmt.Println("\n=== Example 2: Nested FilterGroups (AND/OR) ===")
+	// (role = admin OR role = moderator) OR (status = active AND age BETWEEN 18 AND 65)
+	executeQuery(db, gen, model.Query{
 		SelectParameter: model.SelectParameter{
 			FilterGroups: []model.FilterGroup{
 				{
 					Condition: model.Or,
 					Filters: []model.Filter{
-						{
-							FieldName: "role",
-							Operator:  model.IsEqual,
-							Value:     "admin",
-						},
-						{
-							FieldName: "role",
-							Operator:  model.IsEqual,
-							Value:     "moderator",
-						},
+						{FieldName: "role", Operator: model.IsEqual, Value: "admin"},
+						{FieldName: "role", Operator: model.IsEqual, Value: "moderator"},
 					},
-				},
-				{
-					Condition: model.And,
-					Filters: []model.Filter{
+					FilterGroups: []model.FilterGroup{
 						{
-							FieldName: "status",
-							Operator:  model.IsEqual,
-							Value:     "active",
-						},
-						{
-							FieldName:   "age",
-							Operator:    model.IsBetween,
-							RangeValues: []any{18, 65},
+							Condition: model.And,
+							Filters: []model.Filter{
+								{FieldName: "status", Operator: model.IsEqual, Value: "active"},
+								{FieldName: "age", Operator: model.IsBetween, RangeValues: []any{18, 65}},
+							},
 						},
 					},
 				},
 			},
-			PageDescriptor: model.Pagination{
-				Page:     1,
-				PageSize: 20,
-			},
+			PageDescriptor: model.Pagination{Page: 1, PageSize: 20},
 		},
-	}
-	executeQuery(db, generator, complexQuery)
+	})
 
-	// Example 3: Global search
 	fmt.Println("\n=== Example 3: Global Search ===")
-	searchQuery := model.Query{
-		Search: "john", // Searches all searchable fields (name, email)
+	executeQuery(db, gen, model.Query{
+		Search: "john", // matches any Searchable field: name, email
 		SelectParameter: model.SelectParameter{
-			PageDescriptor: model.Pagination{
-				Page:     1,
-				PageSize: 10,
-			},
+			PageDescriptor: model.Pagination{Page: 1, PageSize: 10},
 		},
-	}
-	executeQuery(db, generator, searchQuery)
+	})
 
-	// Example 4: Multiple sorts
 	fmt.Println("\n=== Example 4: Multiple Sorts ===")
-	sortQuery := model.Query{
+	executeQuery(db, gen, model.Query{
 		SelectParameter: model.SelectParameter{
 			Sorts: []model.Sort{
-				{
-					FieldName:     "status",
-					SortDirection: model.Ascending,
-				},
-				{
-					FieldName:     "age",
-					SortDirection: model.Descending,
-				},
+				{FieldName: "status", SortDirection: model.Ascending},
+				{FieldName: "age", SortDirection: model.Descending},
 			},
-			PageDescriptor: model.Pagination{
-				Page:     1,
-				PageSize: 10,
-			},
+			PageDescriptor: model.Pagination{Page: 1, PageSize: 10},
 		},
-	}
-	executeQuery(db, generator, sortQuery)
+	})
 
-	// Example 5: Field projection (select specific columns)
 	fmt.Println("\n=== Example 5: Field Projection ===")
-	selectQuery := model.Query{
+	executeQuery(db, gen, model.Query{
 		SelectParameter: model.SelectParameter{
-			Fields: []string{"id", "name", "email"}, // Only select these fields
+			Fields: []string{"id", "name", "email"},
 			Filters: []model.Filter{
-				{
-					FieldName: "status",
-					Operator:  model.IsEqual,
-					Value:     "active",
-				},
+				{FieldName: "status", Operator: model.IsEqual, Value: "active"},
 			},
-			PageDescriptor: model.Pagination{
-				Page:     1,
-				PageSize: 10,
-			},
+			PageDescriptor: model.Pagination{Page: 1, PageSize: 10},
 		},
-	}
-	executeQuery(db, generator, selectQuery)
+	})
 
-	// Example 6: Range filters (IN, BETWEEN)
-	fmt.Println("\n=== Example 6: Range Filters ===")
-	rangeQuery := model.Query{
+	fmt.Println("\n=== Example 6: Range Filters (IN, BETWEEN) ===")
+	executeQuery(db, gen, model.Query{
 		SelectParameter: model.SelectParameter{
 			Filters: []model.Filter{
-				{
-					FieldName:   "status",
-					Operator:    model.IsIn,
-					RangeValues: []any{"active", "pending", "verified"},
-				},
-				{
-					FieldName:   "age",
-					Operator:    model.IsBetween,
-					RangeValues: []any{25, 35},
-				},
+				{FieldName: "status", Operator: model.IsIn, RangeValues: []any{"active", "pending", "verified"}},
+				{FieldName: "age", Operator: model.IsBetween, RangeValues: []any{25, 35}},
 			},
-			PageDescriptor: model.Pagination{
-				Page:     1,
-				PageSize: 10,
-			},
+			PageDescriptor: model.Pagination{Page: 1, PageSize: 10},
 		},
-	}
-	executeQuery(db, generator, rangeQuery)
+	})
 
-	// Example 7: NULL checks
 	fmt.Println("\n=== Example 7: NULL Checks ===")
-	nullQuery := model.Query{
+	executeQuery(db, gen, model.Query{
 		SelectParameter: model.SelectParameter{
 			Filters: []model.Filter{
-				{
-					FieldName: "deleted_at",
-					Operator:  model.IsNull, // Only non-deleted records
-				},
+				{FieldName: "deleted_at", Operator: model.IsNull},
 			},
-			PageDescriptor: model.Pagination{
-				Page:     1,
-				PageSize: 10,
-			},
+			PageDescriptor: model.Pagination{Page: 1, PageSize: 10},
 		},
-	}
-	executeQuery(db, generator, nullQuery)
+	})
 
-	// Example 8: Include soft-deleted records
-	fmt.Println("\n=== Example 8: Include Soft-Deleted ===")
-	softDeleteQuery := model.Query{
-		IncludeDeleted: true, // Include soft-deleted records
+	fmt.Println("\n=== Example 8: String Matching Operators ===")
+	executeQuery(db, gen, model.Query{
 		SelectParameter: model.SelectParameter{
 			Filters: []model.Filter{
-				{
-					FieldName: "status",
-					Operator:  model.IsEqual,
-					Value:     "active",
-				},
+				{FieldName: "email", Operator: model.IsEndWith, Value: "@example.com"},
+				{FieldName: "name", Operator: model.IsContain, Value: "smith"},
 			},
-			PageDescriptor: model.Pagination{
-				Page:     1,
-				PageSize: 10,
-			},
+			PageDescriptor: model.Pagination{Page: 1, PageSize: 10},
 		},
-	}
-	executeQuery(db, generator, softDeleteQuery)
+	})
 
-	// Example 9: DISTINCT query
-	fmt.Println("\n=== Example 9: Distinct Query ===")
-	distinctQuery := model.Query{
-		Distinct: true, // Apply DISTINCT
-		SelectParameter: model.SelectParameter{
-			Fields: []string{"status", "role"},
-			PageDescriptor: model.Pagination{
-				Page:     1,
-				PageSize: 10,
-			},
-		},
-	}
-	executeQuery(db, generator, distinctQuery)
+	fmt.Println("\n=== Example 9: Parsing a Query Straight From a URL ===")
+	// Mirrors a real frontend request, e.g.:
+	//   GET /v2/users?search=capital&sort=age:asc&pageSize=10&page=2&filter=status:active:equals|role:admin:notequals
+	req, _ := http.NewRequest(http.MethodGet,
+		"/v2/users?search=capital&sort=age:asc&pageSize=10&page=2&filter=status:active:equals|role:admin:notequals",
+		nil)
 
-	// Example 10: String matching operators
-	fmt.Println("\n=== Example 10: String Matching ===")
-	stringQuery := model.Query{
-		SelectParameter: model.SelectParameter{
-			Filters: []model.Filter{
-				{
-					FieldName: "email",
-					Operator:  model.IsEndWith,
-					Value:     "@example.com",
-				},
-				{
-					FieldName: "name",
-					Operator:  model.IsContain,
-					Value:     "smith",
-				},
-			},
-			PageDescriptor: model.Pagination{
-				Page:     1,
-				PageSize: 10,
-			},
-		},
+	urlQuery, err := binding.ParseRequest(req, nil)
+	if err != nil {
+		log.Printf("Error parsing URL query: %v\n", err)
+	} else {
+		executeQuery(db, gen, urlQuery)
 	}
-	executeQuery(db, generator, stringQuery)
 }
 
+// executeQuery compiles q into GORM scopes via gen.Scopes, applies them, and
+// prints the results. Any schema validation error (unknown field, disallowed
+// operator, malformed range, too many filters/sorts) is caught here rather
+// than surfacing as a raw SQL error from the database.
 func executeQuery(db *gorm.DB, gen *sql_generator.Generator, query model.Query) {
-	// Generate scopes from the query
 	scopes, err := gen.Scopes(query)
 	if err != nil {
 		log.Printf("Error generating scopes: %v\n", err)
 		return
 	}
 
-	// Apply scopes and execute query
 	var users []User
 	result := db.Scopes(scopes...).Find(&users)
-
 	if result.Error != nil {
 		log.Printf("Error executing query: %v\n", result.Error)
 		return

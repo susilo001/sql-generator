@@ -30,8 +30,6 @@
 | Field projection | SELECT specific columns via `Fields []string` |
 | Eager loading | GORM `Preload` relationships via `Preloads []string` |
 | Automatic joins | LEFT / INNER join auto-applied when a joined field is referenced |
-| DISTINCT | Remove duplicate rows |
-| Soft delete | `IncludeDeleted` flag calls GORM `Unscoped()` |
 
 ### Security
 - Field and operator whitelisting via `ModelMeta.Fields` and `FieldMeta.Operators`
