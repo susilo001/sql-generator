@@ -2,6 +2,30 @@
 
 All notable changes to sql-generator will be documented in this file.
 
+## [1.2.0] - 2026-07-09
+
+Minor release. Focus: schema generation from model struct tags.
+
+### Features
+- Added `FromModel(model, opts...)` — builds a `Generator` by reflecting
+  over any model struct, eliminating hand-written `ModelMeta` for flat
+  (non-joined) fields
+- Added `sqlgen` struct tag grammar: `filter:<aliases|presets>`, `search`,
+  `nosearch`, `column:<name>`, `-`
+- Operator presets: `all`, `comparable` (eq,ne,gt,gte,lt,lte,between),
+  `text` (eq,contains,startswith,endswith)
+- Untagged fields default to all operators; string fields searchable by
+  default, non-string fields not
+- Column resolution: `sqlgen` `column:` → `gorm:"column:..."` → snake_case
+  of the Go field name (matches GORM's naming strategy)
+- Embedded structs (e.g. `gorm.Model`) recursed; unexported fields skipped;
+  malformed tags and duplicate columns fail fast with an error
+- Added `Options` struct mirroring the Generator's tunable settings
+
+### Changed
+- `example/example.go` and README Quick Start now derive the schema via
+  `FromModel` instead of a hand-written `ModelMeta`
+
 ## [1.1.0] - 2026-07-09
 
 Minor release. Focus: URL-query parsing, FilterGroup correctness, and

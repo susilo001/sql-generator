@@ -27,29 +27,27 @@ go get -u sql-generator
 
 ```go
 import (
-    "sql-generator"
-    "sql-generator/model"
+    sql_generator "github.com/susilo001/sql-generator"
+    "github.com/susilo001/sql-generator/model"
     "gorm.io/gorm"
 )
 
-// 1. Define your schema metadata
-generator := &sql_generator.Generator{
-    Schema: &sql_generator.ModelMeta{
-        Fields: map[string]sql_generator.FieldMeta{
-            "name": {
-                Column:     "name",
-                Searchable: true,
-                Operators: map[model.Operator]bool{
-                    model.IsEqual:   true,
-                    model.IsContain: true,
-                },
-            },
-        },
-    },
+// 1. Derive the schema from your GORM model's struct tags
+type User struct {
+    ID     uint   `gorm:"primaryKey" sqlgen:"filter:eq,ne,in"`
+    Name   string `sqlgen:"filter:text;search"`
+    Status string `sqlgen:"filter:eq,ne,in,notin;nosearch"`
+    Age    int    `sqlgen:"filter:comparable"`
+}
+
+generator, err := sql_generator.FromModel(&User{}, sql_generator.Options{
     DefaultFieldForSort: "id",
     CaseSensitiveSearch: false,
     MaxFiltersPerQuery:  50,
     MaxSortsPerQuery:    10,
+})
+if err != nil {
+    log.Fatal(err)
 }
 
 // 2. Build your query from frontend request
@@ -78,6 +76,49 @@ if err != nil {
 // 4. Execute query
 var users []User
 db.Scopes(scopes...).Find(&users)
+```
+
+## Schema from Struct Tags (`FromModel`)
+
+`FromModel` reflects over any model struct and builds the `ModelMeta`
+whitelist for you. Hand-written `ModelMeta` still works and is required for
+joined fields.
+
+**Default (no `sqlgen` tag):** field is included with **all** filter
+operators, sortable and selectable. String fields are searchable by
+default; non-string fields are not (LIKE/ILIKE is text-only). Tags only
+restrict or adjust:
+
+| Tag part | Meaning |
+|---|---|
+| `filter:eq,ne,gt,gte,lt,lte,contains,startswith,endswith,between,in,notin,null,notnull` | Restrict allowed operators to the listed aliases |
+| `filter:all` | All 14 operators (same as untagged default) |
+| `filter:comparable` | `eq,ne,gt,gte,lt,lte,between` |
+| `filter:text` | `eq,contains,startswith,endswith` |
+| `search` / `nosearch` | Force field into / out of global search |
+| `column:custom_name` | Override the SQL column name |
+| `-` | Exclude the field from the schema entirely |
+
+Parts are separated by `;`, list items by `,`. Column name resolution:
+`sqlgen` `column:` override → `gorm:"column:..."` → snake_case of the Go
+field name (`TypeID` → `type_id`). The resolved column is also the
+query-facing field name used in filters/sorts. Embedded structs (e.g.
+`gorm.Model`) are recursed into; unexported fields are skipped; malformed
+tags and duplicate columns return an error.
+
+```go
+type Product struct {
+    gorm.Model
+    TypeID     int    `sqlgen:"filter:eq,ne,in"`
+    Name       string `sqlgen:"filter:text;search"`
+    DataStatus string `sqlgen:"filter:eq,ne,in,notin;nosearch"`
+    Secret     string `sqlgen:"-"`
+}
+
+gen, err := sql_generator.FromModel(&Product{}, sql_generator.Options{
+    DefaultFieldForSort: "id",
+    MaxFiltersPerQuery:  50,
+})
 ```
 
 ## Supported Operators
