@@ -235,9 +235,7 @@ func main() {
 	fmt.Println("\n=== Example 9: Parsing a Query Straight From a URL ===")
 	// Mirrors a real frontend request, e.g.:
 	//   GET /v2/users?search=capital&sort=age:asc&pageSize=10&page=2&filter=status:active:equals|role:admin:notequals
-	req, _ := http.NewRequest(http.MethodGet,
-		"/v2/users?search=capital&sort=age:asc&pageSize=10&page=2&filter=status:active:equals|role:admin:notequals",
-		nil)
+	req, _ := http.NewRequest(http.MethodGet, "/v2/users?search=capital&sort=age:asc&pageSize=10&page=2&filter=status:active:equals|role:admin:notequals", nil)
 
 	urlQuery, err := binding.ParseRequest(req, nil)
 	if err != nil {
