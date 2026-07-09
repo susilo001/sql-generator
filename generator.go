@@ -40,6 +40,14 @@ type ModelMeta struct {
 	// column, join, and operator metadata. Keys are matched exactly against
 	// Filter.FieldName, Sort.FieldName, and SelectParameter.Fields entries.
 	Fields map[string]FieldMeta
+
+	// AllowedPreloads, when non-nil, whitelists which GORM association
+	// names a Query may request via SelectParameter.Preloads. A Preload
+	// entry not present (or set to false) in this map causes Scopes to
+	// return an error. When nil (the default), all preload names are
+	// passed through to GORM unvalidated, preserving the previous
+	// behavior.
+	AllowedPreloads map[string]bool
 }
 
 // FieldMeta describes how a single query-facing field maps to the
@@ -121,6 +129,33 @@ type Generator struct {
 	// MaxSortsPerQuery caps the number of Sort entries allowed in a single
 	// Query. Zero (the default) means unlimited.
 	MaxSortsPerQuery int
+
+	// MaxFilterGroupDepth caps how deeply FilterGroups may nest inside
+	// each other. A top-level FilterGroup has depth 1. Zero (the default)
+	// means unlimited. Deep nesting is cheap for a client to send but
+	// costs the server recursion stack and superlinear memory to compile,
+	// so bounding it (e.g. to 32) is recommended for internet-facing
+	// deployments.
+	MaxFilterGroupDepth int
+
+	// MaxFilterGroupsPerQuery caps the total number of FilterGroup nodes
+	// in a single Query, counted recursively. This is independent of
+	// MaxFiltersPerQuery, which counts Filter leaves only — without this
+	// limit, a query full of empty groups would bypass the filter cap
+	// entirely. Zero (the default) means unlimited.
+	MaxFilterGroupsPerQuery int
+
+	// MaxPageSize caps SelectParameter.PageDescriptor.PageSize. A request
+	// asking for more rows than this is clamped down to MaxPageSize, not
+	// rejected. Zero (the default) means no upper bound, preserving the
+	// previous behavior.
+	MaxPageSize int
+
+	// MaxRangeValues caps the number of elements allowed in a Filter's
+	// RangeValues for the IS_IN and IS_NOT_IN operators, bounding the size
+	// of generated IN (...) lists. A filter exceeding the cap is rejected
+	// with an error. Zero (the default) means unlimited.
+	MaxRangeValues int
 }
 
 // Scopes compiles q into an ordered slice of GORM scopes according to g's
@@ -197,6 +232,9 @@ func (g *Generator) filterScopes(q model.Query) ([]func(*gorm.DB) *gorm.DB, erro
 		// Validate BEFORE creating scope
 		if op == model.IsBetween && len(rng) != 2 {
 			return nil, fmt.Errorf("IS_BETWEEN requires exactly 2 values")
+		}
+		if err := g.validateRangeValues(f); err != nil {
+			return nil, err
 		}
 
 		scope := func(db *gorm.DB) *gorm.DB {
@@ -325,9 +363,9 @@ func (g *Generator) sortScope(q model.Query) func(*gorm.DB) *gorm.DB {
 
 // paginationScope applies LIMIT/OFFSET derived from
 // q.SelectParameter.PageDescriptor. Page defaults to 1 and PageSize defaults
-// to 20 when unset or less than 1. There is no upper bound on PageSize —
-// callers that need to cap page size to prevent large-result-set abuse must
-// enforce that themselves before calling Scopes.
+// to 20 when unset or less than 1. When g.MaxPageSize is set (> 0), a
+// larger requested PageSize is clamped down to MaxPageSize rather than
+// rejected; when MaxPageSize is 0 there is no upper bound.
 func (g *Generator) paginationScope(q model.Query) func(*gorm.DB) *gorm.DB {
 	return func(db *gorm.DB) *gorm.DB {
 		p := q.SelectParameter.PageDescriptor.Page
@@ -339,14 +377,19 @@ func (g *Generator) paginationScope(q model.Query) func(*gorm.DB) *gorm.DB {
 		if s < 1 {
 			s = 20
 		}
+		if g.MaxPageSize > 0 && s > g.MaxPageSize {
+			s = g.MaxPageSize
+		}
 
 		return db.Limit(s).Offset((p - 1) * s)
 	}
 }
 
-// validateQuery enforces g.MaxFiltersPerQuery and g.MaxSortsPerQuery against
-// q, counting Filters recursively through all FilterGroups via
-// countFiltersInGroup. A zero limit means unlimited (the default). It
+// validateQuery enforces the Generator's structural limits against q:
+// MaxFiltersPerQuery (counting Filter leaves recursively through all
+// FilterGroups), MaxSortsPerQuery, MaxFilterGroupDepth,
+// MaxFilterGroupsPerQuery, and — when ModelMeta.AllowedPreloads is set —
+// the preload whitelist. A zero limit means unlimited (the default). It
 // returns an error describing which limit was exceeded, or nil if q is
 // within bounds.
 func (g *Generator) validateQuery(q model.Query) error {
@@ -364,6 +407,32 @@ func (g *Generator) validateQuery(q model.Query) error {
 		return fmt.Errorf("too many sorts: %d (max: %d)", len(q.SelectParameter.Sorts), g.MaxSortsPerQuery)
 	}
 
+	if g.MaxFilterGroupDepth > 0 {
+		for _, fg := range q.SelectParameter.FilterGroups {
+			if depth := g.filterGroupDepth(fg); depth > g.MaxFilterGroupDepth {
+				return fmt.Errorf("filter groups nested too deeply: %d (max: %d)", depth, g.MaxFilterGroupDepth)
+			}
+		}
+	}
+
+	if g.MaxFilterGroupsPerQuery > 0 {
+		totalGroups := 0
+		for _, fg := range q.SelectParameter.FilterGroups {
+			totalGroups += g.countGroups(fg)
+		}
+		if totalGroups > g.MaxFilterGroupsPerQuery {
+			return fmt.Errorf("too many filter groups: %d (max: %d)", totalGroups, g.MaxFilterGroupsPerQuery)
+		}
+	}
+
+	if g.Schema.AllowedPreloads != nil {
+		for _, p := range q.SelectParameter.Preloads {
+			if !g.Schema.AllowedPreloads[p] {
+				return fmt.Errorf("preload not allowed: %s", p)
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -373,6 +442,62 @@ func (g *Generator) countFiltersInGroup(fg model.FilterGroup) int {
 	count := len(fg.Filters)
 	for _, nested := range fg.FilterGroups {
 		count += g.countFiltersInGroup(nested)
+	}
+	return count
+}
+
+// validateRangeValues enforces g.MaxRangeValues against a Filter using the
+// IS_IN or IS_NOT_IN operator, bounding the size of the generated IN (...)
+// list. Other operators, and a zero MaxRangeValues, always pass.
+func (g *Generator) validateRangeValues(f model.Filter) error {
+	if g.MaxRangeValues <= 0 {
+		return nil
+	}
+	if f.Operator != model.IsIn && f.Operator != model.IsNotIn {
+		return nil
+	}
+	if len(f.RangeValues) > g.MaxRangeValues {
+		return fmt.Errorf("too many values for %s on %s: %d (max: %d)", f.Operator, f.FieldName, len(f.RangeValues), g.MaxRangeValues)
+	}
+	return nil
+}
+
+// filterGroupDepth returns the maximum nesting depth of fg, where a group
+// with no nested FilterGroups has depth 1. Implemented iteratively (an
+// explicit work stack instead of recursion) so that measuring the depth of
+// a hostile, deeply nested payload cannot itself exhaust the call stack
+// before the limit check runs.
+func (g *Generator) filterGroupDepth(fg model.FilterGroup) int {
+	type entry struct {
+		group model.FilterGroup
+		depth int
+	}
+	maxDepth := 1
+	stack := []entry{{group: fg, depth: 1}}
+	for len(stack) > 0 {
+		e := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if e.depth > maxDepth {
+			maxDepth = e.depth
+		}
+		for _, nested := range e.group.FilterGroups {
+			stack = append(stack, entry{group: nested, depth: e.depth + 1})
+		}
+	}
+	return maxDepth
+}
+
+// countGroups returns the total number of FilterGroup nodes rooted at fg,
+// including fg itself. Iterative for the same hostile-input reason as
+// filterGroupDepth.
+func (g *Generator) countGroups(fg model.FilterGroup) int {
+	count := 0
+	stack := []model.FilterGroup{fg}
+	for len(stack) > 0 {
+		cur := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		count++
+		stack = append(stack, cur.FilterGroups...)
 	}
 	return count
 }
@@ -447,6 +572,9 @@ func (g *Generator) buildFilterGroupSQL(fg model.FilterGroup) (string, []any, er
 
 		if f.Operator == model.IsBetween && len(f.RangeValues) != 2 {
 			return "", nil, fmt.Errorf("IS_BETWEEN requires exactly 2 values")
+		}
+		if err := g.validateRangeValues(f); err != nil {
+			return "", nil, err
 		}
 
 		condition, filterArgs := g.buildFilterCondition(meta.Column, f)
@@ -599,8 +727,10 @@ func (g *Generator) selectScope(q model.Query) func(*gorm.DB) *gorm.DB {
 
 // preloadScope applies db.Preload for every entry in
 // q.SelectParameter.Preloads, enabling GORM eager loading of the named
-// associations. Preload names are passed through to GORM as-is and are not
-// validated against g.Schema — an invalid association name will fail at
+// associations. When ModelMeta.AllowedPreloads is set, entries are
+// validated (and rejected with an error) by validateQuery before this
+// scope is ever built; when AllowedPreloads is nil, names are passed
+// through to GORM as-is and an invalid association name will fail at
 // GORM's query-execution time, not here.
 func (g *Generator) preloadScope(q model.Query) func(*gorm.DB) *gorm.DB {
 	return func(db *gorm.DB) *gorm.DB {

@@ -224,11 +224,11 @@ func TestSecurity_URLBindingInjectionEndToEnd(t *testing.T) {
 	}
 }
 
-func TestSecurity_DeepNestingIsUnbounded(t *testing.T) {
-	// Measures the known gap: FilterGroup nesting depth is not limited.
-	// Depth 10 000 compiles without error today. This test exists so that
-	// if a MaxFilterGroupDepth limit is added later, it will fail and force
-	// an intentional update.
+func TestSecurity_DeepNestingUnboundedByDefault(t *testing.T) {
+	// With MaxFilterGroupDepth left at its zero value, nesting depth is
+	// unlimited (backward-compatible default). Depth 10 000 compiles
+	// without error. Internet-facing deployments should set
+	// MaxFilterGroupDepth — see TestSecurity_HardeningLimits.
 	gen := newSecuritySchema()
 	leaf := model.FilterGroup{
 		Condition: model.And,
@@ -245,7 +245,133 @@ func TestSecurity_DeepNestingIsUnbounded(t *testing.T) {
 	if _, err := gen.Scopes(q); err != nil {
 		t.Fatalf("deep nesting unexpectedly rejected: %v", err)
 	}
-	t.Log("confirmed: 10000-deep FilterGroup nesting is accepted (no depth limit exists)")
+	t.Log("confirmed: 10000-deep FilterGroup nesting is accepted when MaxFilterGroupDepth is unset")
+}
+
+// nestedGroups builds a FilterGroup chain of the given depth with one
+// filter at the innermost level.
+func nestedGroups(depth int) model.FilterGroup {
+	group := model.FilterGroup{
+		Condition: model.And,
+		Filters: []model.Filter{
+			{FieldName: "type_id", Operator: model.IsEqual, Value: 1},
+		},
+	}
+	for i := 1; i < depth; i++ {
+		group = model.FilterGroup{Condition: model.Or, FilterGroups: []model.FilterGroup{group}}
+	}
+	return group
+}
+
+func TestSecurity_HardeningLimits(t *testing.T) {
+	t.Run("MaxFilterGroupDepth rejects deep nesting", func(t *testing.T) {
+		gen := newSecuritySchema()
+		gen.MaxFilterGroupDepth = 4
+
+		q := model.Query{}
+		q.SelectParameter.FilterGroups = []model.FilterGroup{nestedGroups(4)}
+		if _, err := gen.Scopes(q); err != nil {
+			t.Fatalf("depth 4 should pass with limit 4: %v", err)
+		}
+
+		q.SelectParameter.FilterGroups = []model.FilterGroup{nestedGroups(5)}
+		if _, err := gen.Scopes(q); err == nil {
+			t.Fatal("depth 5 should be rejected with limit 4")
+		}
+	})
+
+	t.Run("MaxFilterGroupDepth check survives hostile depth without stack growth", func(t *testing.T) {
+		// The depth walk is iterative, so even a 100000-deep payload is
+		// rejected cleanly instead of exhausting the call stack during
+		// validation.
+		gen := newSecuritySchema()
+		gen.MaxFilterGroupDepth = 32
+		q := model.Query{}
+		q.SelectParameter.FilterGroups = []model.FilterGroup{nestedGroups(100_000)}
+		if _, err := gen.Scopes(q); err == nil {
+			t.Fatal("expected depth-limit error for 100000-deep payload")
+		}
+	})
+
+	t.Run("MaxFilterGroupsPerQuery counts empty groups", func(t *testing.T) {
+		// Empty groups carry zero Filter leaves, so MaxFiltersPerQuery
+		// alone cannot bound them — MaxFilterGroupsPerQuery must.
+		gen := newSecuritySchema()
+		gen.MaxFiltersPerQuery = 20
+		gen.MaxFilterGroupsPerQuery = 10
+		q := model.Query{}
+		for i := 0; i < 11; i++ {
+			q.SelectParameter.FilterGroups = append(q.SelectParameter.FilterGroups,
+				model.FilterGroup{Condition: model.And})
+		}
+		if _, err := gen.Scopes(q); err == nil {
+			t.Fatal("expected too-many-filter-groups error for 11 empty groups")
+		}
+	})
+
+	t.Run("MaxPageSize clamps oversized requests", func(t *testing.T) {
+		gen := newSecuritySchema()
+		gen.MaxPageSize = 100
+		q := model.Query{}
+		q.SelectParameter.PageDescriptor = model.Pagination{Page: 1, PageSize: 50_000_000}
+		_, vars := buildSQL(t, gen, q)
+		if len(vars) == 0 || vars[len(vars)-1] != 100 {
+			t.Fatalf("expected LIMIT bind var clamped to 100, got vars: %v", vars)
+		}
+	})
+
+	t.Run("MaxRangeValues rejects oversized IN lists", func(t *testing.T) {
+		gen := newSecuritySchema()
+		gen.MaxRangeValues = 100
+		vals := make([]any, 101)
+		for i := range vals {
+			vals[i] = i
+		}
+		q := model.Query{}
+		q.SelectParameter.Filters = []model.Filter{
+			{FieldName: "type_id", Operator: model.IsIn, RangeValues: vals},
+		}
+		if _, err := gen.Scopes(q); err == nil {
+			t.Fatal("expected too-many-values error for 101-element IN list")
+		}
+
+		// Same limit applies inside FilterGroups.
+		q = model.Query{}
+		q.SelectParameter.FilterGroups = []model.FilterGroup{{
+			Condition: model.And,
+			Filters: []model.Filter{
+				{FieldName: "type_id", Operator: model.IsIn, RangeValues: vals},
+			},
+		}}
+		if _, err := gen.Scopes(q); err == nil {
+			t.Fatal("expected too-many-values error inside FilterGroup")
+		}
+	})
+
+	t.Run("AllowedPreloads rejects unlisted associations", func(t *testing.T) {
+		gen := newSecuritySchema()
+		gen.Schema.AllowedPreloads = map[string]bool{"Type": true}
+
+		q := model.Query{}
+		q.SelectParameter.Preloads = []string{"Type"}
+		if _, err := gen.Scopes(q); err != nil {
+			t.Fatalf("whitelisted preload should pass: %v", err)
+		}
+
+		q.SelectParameter.Preloads = []string{"Type", "SecretAudit"}
+		if _, err := gen.Scopes(q); err == nil {
+			t.Fatal("expected preload-not-allowed error for unlisted association")
+		}
+	})
+
+	t.Run("AllowedPreloads nil preserves passthrough", func(t *testing.T) {
+		gen := newSecuritySchema()
+		q := model.Query{}
+		q.SelectParameter.Preloads = []string{"Anything"}
+		if _, err := gen.Scopes(q); err != nil {
+			t.Fatalf("nil AllowedPreloads must not validate preloads: %v", err)
+		}
+	})
 }
 
 // --- Benchmarks -----------------------------------------------------------
