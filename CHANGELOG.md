@@ -2,10 +2,10 @@
 
 All notable changes to sql-generator will be documented in this file.
 
-## [2.0.0] - 2026-07-09
+## [1.1.0] - 2026-07-09
 
-Second major release. Focus: URL-query parsing, FilterGroup correctness,
-and hardening.
+Minor release. Focus: URL-query parsing, FilterGroup correctness, and
+hardening.
 
 ### Breaking Changes
 - Removed JSON body binding helpers from `binding/binding.go`
