@@ -2,6 +2,51 @@
 
 All notable changes to sql-generator will be documented in this file.
 
+## [2.0.0] - 2026-07-09
+
+Second major release. Focus: URL-query parsing, FilterGroup correctness,
+and hardening.
+
+### Breaking Changes
+- Removed JSON body binding helpers from `binding/binding.go`
+- Replaced body-based binding flow with URL query parsing via `binding.ParseRequest`, `binding.ParseRawURL`, and `binding.ParseValues`
+- Removed stale `IncludeDeleted` / `Distinct` references from examples and docs
+
+### Features
+- Added direct URL query parsing for:
+  - `search`
+  - `page`
+  - `pageSize`
+  - `sort=field:asc|desc`
+  - `filter=field:value:op`
+  - `fields`
+  - `preloads`
+- Added case-insensitive operator aliases for URL parsing:
+  - `equals`, `notequals`, `greaterthan`, `greaterthanorequal`
+  - `lessthan`, `lessthanorequal`, `contains`
+  - `startswith`, `endswith`, `isin`, `isnotin`
+- Added opt-in hardening controls:
+  - `Generator.MaxFilterGroupDepth`
+  - `Generator.MaxFilterGroupsPerQuery`
+  - `Generator.MaxPageSize`
+  - `Generator.MaxRangeValues`
+  - `ModelMeta.AllowedPreloads`
+
+### Fixes
+- Fixed nested `FilterGroup` SQL generation so nested `AND` / `OR` logic is preserved correctly
+- Unknown fields and disallowed operators inside nested `FilterGroup`s now fail with errors instead of being silently skipped
+- Upgraded `github.com/jackc/pgx/v5` to `v5.9.2` to remove reachable SQL injection advisory `GO-2026-5004`
+
+### Security
+- Added security probe tests proving hostile filter values, search terms, IN-list values, field names, sort fields, and full URL payloads remain parameterized or rejected
+- Added benchmark coverage for scope generation, URL parsing, end-to-end dry-run SQL rendering, and deep nesting behavior
+- Preserved zero-value backward compatibility for new generator limits
+
+### Documentation
+- Rewrote `example/example.go` to match current features and new URL-binding flow
+- Added package and symbol godoc across `generator.go`, `binding/url.go`, and `model/*.go`
+- Corrected changelog/docs to remove features no longer present
+
 ## [1.0.0] - 2026-05-05
 
 Initial public release.
