@@ -2,6 +2,21 @@
 
 All notable changes to sql-generator will be documented in this file.
 
+## [1.4.0] - 2026-07-13
+
+### Features
+- Added `FieldMeta.Joins` and `joins:table_or_alias,...` struct-tag support
+  for expression columns that require multiple declared joins, such as a
+  `COALESCE` across sibling detail tables
+
+### Fixes
+- Derived `filter:all` from supported operator aliases to prevent preset
+  drift when aliases change
+- Reported leftover parts on join tags as unknown tag parts
+
+### Changed
+- Centralized `sqlgen` tag tokenization for leaf and join parsing
+
 ## [1.3.0] - 2026-07-09
 
 Minor release. Focus: repository-style schemas from entity structs,

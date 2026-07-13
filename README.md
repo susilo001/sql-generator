@@ -101,6 +101,7 @@ restrict or adjust:
 | `join:left` / `join:inner` | Recurse into a nested struct and attach a LEFT/INNER join |
 | `table:table_or_alias` | Joined table declaration; required with `join` |
 | `on:join_condition` | Joined table ON condition; required with `join` |
+| `joins:table_or_alias,...` | Extra declared joins required by leaf expression column |
 | `-` | Exclude the field from the schema entirely |
 
 Parts are separated by `;`, list items by `,`. Column name resolution:
@@ -108,7 +109,9 @@ Parts are separated by `;`, list items by `,`. Column name resolution:
 field name (`TypeID` → `type_id`). `Options.Table` qualifies root columns
 (`id` → `investment_products.id`) while field names stay bare (`id`).
 `column:` overrides are never qualified, so expressions like
-`COALESCE(mutual_fund_details.is_syariah, bond_details.is_syariah)` work.
+`COALESCE(mutual_fund_details.is_syariah, bond_details.is_syariah)` work. Add
+`joins:bond_details` on an expression field when it references a sibling joined
+table; each name must match a declared `table:` name or alias.
 Embedded structs (e.g. `gorm.Model`) are recursed into; plain association
 structs/slices are skipped unless they carry a `join` tag; unexported fields
 are skipped; malformed tags and duplicate query-facing names return an
@@ -128,7 +131,7 @@ type Product struct {
 type FundDetail struct {
     FundCategory      string `sqlgen:"filter:eq,in,contains,null,notnull;search"`
     InvestmentManager string `sqlgen:"filter:eq,contains,startswith,null,notnull;search"`
-    IsSyariah bool `sqlgen:"name:is_syariah;column:COALESCE(mutual_fund_details.is_syariah, bond_details.is_syariah);filter:eq"`
+    IsSyariah bool `sqlgen:"name:is_syariah;column:COALESCE(mutual_fund_details.is_syariah, bond_details.is_syariah);filter:eq;joins:bond_details"`
 }
 
 type BondDetail struct {

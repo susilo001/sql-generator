@@ -66,6 +66,15 @@ type FieldMeta struct {
 	// SelectParameter.Fields. See JoinMeta and the joinScope builder.
 	Join *JoinMeta
 
+	// Joins declares additional joins, beyond Join, required to resolve
+	// this field. It exists for columns whose SQL expression spans more
+	// than one joined table (e.g. a COALESCE across two detail tables),
+	// where a single Join cannot express every table the column
+	// references. Every entry is applied whenever this field is
+	// referenced, alongside Join if it is also set. Most fields leave
+	// this nil or empty; it is additive and never required.
+	Joins []JoinMeta
+
 	// Searchable marks this field as a target for the global
 	// model.Query.Search term. When true, the field's Column is included in
 	// a LIKE/ILIKE OR clause alongside every other Searchable field (see
@@ -657,13 +666,14 @@ func (g *Generator) buildFilterCondition(col string, f model.Filter) (string, []
 }
 
 // joinScope inspects every field referenced by q (in Filters, Sorts, and
-// SelectParameter.Fields) and applies the JoinMeta declared for each one
-// that has a non-nil Join, deduplicating by Table+On so a join used by
-// multiple fields is only applied once. The join keyword defaults to LEFT
-// when JoinMeta.Type is empty. Fields not present in g.Schema.Fields, or
-// present but with a nil Join, are ignored here (they are validated, if at
-// all, by the scope that consumes them — filterScopes, sortScope, or
-// selectScope).
+// SelectParameter.Fields) and applies every JoinMeta declared for each one
+// — the single Join plus any entries in Joins — deduplicating by Table+On
+// so a join used by multiple fields (or declared on both Join and Joins)
+// is only applied once. The join keyword defaults to LEFT when
+// JoinMeta.Type is empty. Fields not present in g.Schema.Fields, or
+// present but with no joins declared, are ignored here (they are
+// validated, if at all, by the scope that consumes them —
+// filterScopes, sortScope, or selectScope).
 func (g *Generator) joinScope(q model.Query) func(*gorm.DB) *gorm.DB {
 	return func(db *gorm.DB) *gorm.DB {
 		appliedJoins := make(map[string]bool)
@@ -682,16 +692,25 @@ func (g *Generator) joinScope(q model.Query) func(*gorm.DB) *gorm.DB {
 
 		// Apply necessary joins
 		for fieldName := range allFields {
-			if meta, ok := g.Schema.Fields[fieldName]; ok && meta.Join != nil {
-				joinKey := meta.Join.Table + meta.Join.On
-				if !appliedJoins[joinKey] {
-					joinType := meta.Join.Type
-					if joinType == "" {
-						joinType = "LEFT"
-					}
-					db = db.Joins(joinType + " JOIN " + meta.Join.Table + " ON " + meta.Join.On)
-					appliedJoins[joinKey] = true
+			meta, ok := g.Schema.Fields[fieldName]
+			if !ok {
+				continue
+			}
+			joins := meta.Joins
+			if meta.Join != nil {
+				joins = append([]JoinMeta{*meta.Join}, joins...)
+			}
+			for _, jm := range joins {
+				joinKey := jm.Table + jm.On
+				if appliedJoins[joinKey] {
+					continue
 				}
+				joinType := jm.Type
+				if joinType == "" {
+					joinType = "LEFT"
+				}
+				db = db.Joins(joinType + " JOIN " + jm.Table + " ON " + jm.On)
+				appliedJoins[joinKey] = true
 			}
 		}
 

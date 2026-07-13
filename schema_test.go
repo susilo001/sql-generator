@@ -171,7 +171,7 @@ func TestFromModelRejectsMalformedTags(t *testing.T) {
 type mutualFundDetail struct {
 	FundCategory      string `sqlgen:"filter:eq,in,contains,null,notnull;search"`
 	InvestmentManager string `sqlgen:"filter:eq,contains,startswith,null,notnull;search"`
-	IsSyariah         bool   `sqlgen:"filter:eq;name:is_syariah;column:COALESCE(mutual_fund_details.is_syariah, bond_details.is_syariah)"`
+	IsSyariah         bool   `sqlgen:"filter:eq;name:is_syariah;column:COALESCE(mutual_fund_details.is_syariah, bond_details.is_syariah);joins:bond_details"`
 }
 
 type bondDetail struct {
@@ -270,6 +270,52 @@ func TestFromModelJoinsAndTableQualification(t *testing.T) {
 			t.Fatalf("SQL missing %q: %s", want, sql)
 		}
 	}
+
+	// Expression columns can require joins beyond their enclosing struct.
+	sql, _ = buildSQL(t, gen, model.Query{
+		SelectParameter: model.SelectParameter{
+			Filters: []model.Filter{{FieldName: "is_syariah", Operator: model.IsEqual, Value: true}},
+		},
+	})
+	for _, want := range []string{
+		"LEFT JOIN mutual_fund_details ON mutual_fund_details.product_id = investment_products.id",
+		"LEFT JOIN bond_details ON bond_details.product_id = investment_products.id",
+		"COALESCE(mutual_fund_details.is_syariah, bond_details.is_syariah) = ?",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("SQL missing %q: %s", want, sql)
+		}
+	}
+}
+
+func TestFromModelJoinAliasQualification(t *testing.T) {
+	type detail struct {
+		Code string `sqlgen:"filter:eq"`
+	}
+	type product struct {
+		Detail detail `sqlgen:"join:left;table:product_details pd;on:pd.product_id = products.id"`
+	}
+
+	gen, err := FromModel(&product{}, Options{Table: "products"})
+	if err != nil {
+		t.Fatalf("FromModel: %v", err)
+	}
+	if got := gen.Schema.Fields["code"].Column; got != "pd.code" {
+		t.Fatalf("joined alias column = %q, want pd.code", got)
+	}
+	sql, _ := buildSQL(t, gen, model.Query{
+		SelectParameter: model.SelectParameter{
+			Filters: []model.Filter{{FieldName: "code", Operator: model.IsEqual, Value: "x"}},
+		},
+	})
+	for _, want := range []string{
+		"LEFT JOIN product_details pd ON pd.product_id = products.id",
+		"pd.code = ?",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("SQL missing %q: %s", want, sql)
+		}
+	}
 }
 
 func TestFromModelJoinTagErrors(t *testing.T) {
@@ -278,36 +324,19 @@ func TestFromModelJoinTagErrors(t *testing.T) {
 		model any
 		want  string
 	}{
-		{
-			name: "join missing on",
-			model: struct {
-				Fund mutualFundDetail `sqlgen:"join:left;table:mutual_fund_details"`
-			}{},
-			want: "join tag requires table: and on:",
-		},
-		{
-			name: "join on non-struct",
-			model: struct {
-				Name string `sqlgen:"join:left;table:t;on:t.id = x.id"`
-			}{},
-			want: "join tag requires a struct field",
-		},
-		{
-			name: "unknown join type",
-			model: struct {
-				Fund mutualFundDetail `sqlgen:"join:cross;table:t;on:t.id = x.id"`
-			}{},
-			want: "unknown join type",
-		},
-		{
-			name: "join mixed with filter",
-			model: struct {
-				Fund mutualFundDetail `sqlgen:"join:left;table:t;on:t.id = x.id;filter:eq"`
-			}{},
-			want: "cannot be combined",
-		},
+		{name: "join missing on", model: struct {
+			Fund mutualFundDetail `sqlgen:"join:left;table:mutual_fund_details"`
+		}{}, want: "join tag requires table: and on:"},
+		{name: "join on non-struct", model: struct {
+			Name string `sqlgen:"join:left;table:t;on:t.id = x.id"`
+		}{}, want: "join tag requires a struct field"},
+		{name: "unknown join type", model: struct {
+			Fund mutualFundDetail `sqlgen:"join:cross;table:t;on:t.id = x.id"`
+		}{}, want: "unknown join type"},
+		{name: "join mixed with filter reports unknown tag part", model: struct {
+			Fund mutualFundDetail `sqlgen:"join:left;table:t;on:t.id = x.id;filter:eq"`
+		}{}, want: "unknown tag part"},
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := FromModel(tt.model)

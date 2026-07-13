@@ -17,6 +17,39 @@ import (
 //	Name string `sqlgen:"filter:eq,contains;search"`
 const TagKey = "sqlgen"
 
+// tagPart is one ";"-separated, "key:value" segment of a parsed sqlgen
+// tag. hasValue distinguishes a bare key with no ":" (hasValue false)
+// from a key with an explicit, possibly empty, value (hasValue true).
+type tagPart struct {
+	key      string
+	value    string
+	hasValue bool
+	raw      string
+}
+
+// splitTagParts tokenizes a sqlgen tag into its ";"-separated parts,
+// trimming whitespace and lowercasing each key. It is the single shared
+// tokenizer used by both buildFieldMeta and parseJoinTag, so the tag
+// grammar's low-level syntax (separators, trimming, case-folding) only
+// has one implementation to keep in sync.
+func splitTagParts(tag string) []tagPart {
+	var parts []tagPart
+	for _, raw := range strings.Split(tag, ";") {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		key, value, hasValue := strings.Cut(raw, ":")
+		parts = append(parts, tagPart{
+			key:      strings.ToLower(strings.TrimSpace(key)),
+			value:    strings.TrimSpace(value),
+			hasValue: hasValue,
+			raw:      raw,
+		})
+	}
+	return parts
+}
+
 // Options carries the Generator settings that cannot be derived from the
 // model struct itself. It mirrors the tunable fields on Generator; see the
 // corresponding Generator field documentation for the semantics of each.
@@ -84,14 +117,9 @@ var operatorAliases = map[string]model.Operator{
 // the equality/ordering/range operators, and "text" to the equality and
 // LIKE-style operators.
 var operatorPresets = map[string][]model.Operator{
-	"all": {
-		model.IsEqual, model.IsNotEqual,
-		model.IsLessThan, model.IsMoreThan,
-		model.IsLessThanOrEqual, model.IsMoreThanOrEqual,
-		model.IsContain, model.IsBeginWith, model.IsEndWith,
-		model.IsBetween, model.IsIn, model.IsNotIn,
-		model.IsNull, model.IsNotNull,
-	},
+	// "all" is derived from operatorAliases below (in an init func) rather
+	// than hand-listed here, so the two can never drift out of sync when a
+	// new operator alias is added.
 	"comparable": {
 		model.IsEqual, model.IsNotEqual,
 		model.IsLessThan, model.IsMoreThan,
@@ -102,6 +130,16 @@ var operatorPresets = map[string][]model.Operator{
 		model.IsEqual,
 		model.IsContain, model.IsBeginWith, model.IsEndWith,
 	},
+}
+
+// init derives the all preset from operatorAliases so the two lists
+// cannot drift: every operator alias is, by construction, part of all.
+func init() {
+	all := make([]model.Operator, 0, len(operatorAliases))
+	for _, op := range operatorAliases {
+		all = append(all, op)
+	}
+	operatorPresets["all"] = all
 }
 
 // FromModel builds a Generator by reflecting over a model struct, so the
@@ -179,6 +217,11 @@ var operatorPresets = map[string][]model.Operator{
 // table: and on: are required alongside it and are concatenated into the
 // SQL — they are developer-authored configuration, never request input.
 //
+// A leaf field whose column: expression needs a sibling join may add
+// `joins:table_or_alias,...`. Each value must identify a table: declared
+// by a join-tagged struct field. FromModel attaches those joins in addition
+// to the leaf field's enclosing Join.
+//
 // Embedded (anonymous) structs such as gorm.Model are recursed into;
 // unexported fields are skipped. Named struct fields WITHOUT a join tag
 // are included as leaf columns only when they are database-scalar types
@@ -204,8 +247,11 @@ func FromModel(m any, opts ...Options) (*Generator, error) {
 		o = opts[0]
 	}
 
+	joinRegistry := map[string]JoinMeta{}
+	collectJoins(t, joinRegistry)
+
 	fields := map[string]FieldMeta{}
-	if err := collectFields(t, fields, o.Table, nil); err != nil {
+	if err := collectFields(t, fields, o.Table, nil, joinRegistry); err != nil {
 		return nil, err
 	}
 	if len(fields) == 0 {
@@ -228,13 +274,59 @@ func FromModel(m any, opts ...Options) (*Generator, error) {
 	}, nil
 }
 
+// collectJoins walks t and records every join declared by a nested
+// struct's join tag into registry, keyed by the join's table name (the
+// qualifier before any alias, e.g. "mutual_fund_details"). It runs as a
+// separate pass before collectFields so a leaf field's `joins:` tag part
+// (see buildFieldMeta) can reference a join declared anywhere else in the
+// struct, regardless of field order. Malformed join tags are ignored here;
+// collectFields reports them.
+func collectJoins(t reflect.Type, registry map[string]JoinMeta) {
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+
+		if f.Anonymous {
+			ft := derefType(f.Type)
+			if ft.Kind() == reflect.Struct {
+				collectJoins(ft, registry)
+				continue
+			}
+		}
+
+		if !f.IsExported() {
+			continue
+		}
+
+		tag := f.Tag.Get(TagKey)
+		if tag == "-" {
+			continue
+		}
+
+		jm, _, ok, err := parseJoinTag(f, tag)
+		if err != nil || !ok {
+			continue
+		}
+		registry[joinQualifier(jm.Table)] = *jm
+		if tableName := strings.Fields(jm.Table); len(tableName) > 0 {
+			registry[tableName[0]] = *jm
+		}
+
+		ft := derefType(f.Type)
+		if ft.Kind() == reflect.Struct {
+			collectJoins(ft, registry)
+		}
+	}
+}
+
 // collectFields walks the struct type t and adds one FieldMeta per usable
 // field to out, recursing into embedded (anonymous) structs and into
 // nested structs carrying a join tag. table qualifies plain column names
 // ("" leaves them unqualified); join, when non-nil, is attached to every
-// leaf field collected within that joined struct. It returns an error on
-// the first malformed tag or duplicate query-facing name.
-func collectFields(t reflect.Type, out map[string]FieldMeta, table string, join *JoinMeta) error {
+// leaf field collected within that joined struct. joinRegistry resolves a
+// leaf field's `joins:` tag part (extra joins beyond the enclosing struct's
+// own join) to their declared JoinMeta. It returns an error on the first
+// malformed tag or duplicate query-facing name.
+func collectFields(t reflect.Type, out map[string]FieldMeta, table string, join *JoinMeta, joinRegistry map[string]JoinMeta) error {
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
 
@@ -246,7 +338,7 @@ func collectFields(t reflect.Type, out map[string]FieldMeta, table string, join 
 		if f.Anonymous {
 			ft := derefType(f.Type)
 			if ft.Kind() == reflect.Struct {
-				if err := collectFields(ft, out, table, join); err != nil {
+				if err := collectFields(ft, out, table, join, joinRegistry); err != nil {
 					return err
 				}
 				continue
@@ -269,13 +361,13 @@ func collectFields(t reflect.Type, out map[string]FieldMeta, table string, join 
 			return err
 		} else if ok {
 			if rest != "" {
-				return fmt.Errorf("FromModel: field %s: join tag cannot be combined with other parts (%q)", f.Name, rest)
+				return fmt.Errorf("FromModel: field %s: unknown tag part %q", f.Name, rest)
 			}
 			ft := derefType(f.Type)
 			if ft.Kind() != reflect.Struct {
 				return fmt.Errorf("FromModel: field %s: join tag requires a struct field, got %s", f.Name, ft.Kind())
 			}
-			if err := collectFields(ft, out, joinQualifier(jm.Table), jm); err != nil {
+			if err := collectFields(ft, out, joinQualifier(jm.Table), jm, joinRegistry); err != nil {
 				return err
 			}
 			continue
@@ -288,7 +380,7 @@ func collectFields(t reflect.Type, out map[string]FieldMeta, table string, join 
 			continue
 		}
 
-		meta, name, err := buildFieldMeta(f, tag, table, join)
+		meta, name, err := buildFieldMeta(f, tag, table, join, joinRegistry)
 		if err != nil {
 			return err
 		}
@@ -304,26 +396,38 @@ func collectFields(t reflect.Type, out map[string]FieldMeta, table string, join 
 // SQL column and query-facing field name. table, when non-empty,
 // qualifies the resolved column ("id" → "table.id") unless a column:
 // override is present, which is always used verbatim. join is attached
-// to the FieldMeta so the Generator auto-applies it.
-func buildFieldMeta(f reflect.StructField, tag, table string, join *JoinMeta) (FieldMeta, string, error) {
+// to the FieldMeta so the Generator auto-applies it. joinRegistry
+// resolves the joins: tag part (see below) to previously-declared joins.
+func buildFieldMeta(f reflect.StructField, tag, table string, join *JoinMeta, joinRegistry map[string]JoinMeta) (FieldMeta, string, error) {
 	baseColumn := resolveColumn(f)
 	name := baseColumn
 	nameSet := false
 	columnOverride := ""
 	operators := presetOperatorSet("all")
 	searchable := isStringKind(f.Type)
+	var extraJoins []JoinMeta
 
-	for _, part := range strings.Split(tag, ";") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		key, value, hasValue := strings.Cut(part, ":")
-		key = strings.ToLower(strings.TrimSpace(key))
+	for _, p := range splitTagParts(tag) {
+		key, value, hasValue := p.key, p.value, p.hasValue
 
 		switch key {
+		case "joins":
+			if !hasValue || value == "" {
+				return FieldMeta{}, "", fmt.Errorf("FromModel: field %s: joins tag needs a list, e.g. joins:bond_details", f.Name)
+			}
+			for _, tableName := range strings.Split(value, ",") {
+				tableName = strings.TrimSpace(tableName)
+				if tableName == "" {
+					continue
+				}
+				jm, ok := joinRegistry[tableName]
+				if !ok {
+					return FieldMeta{}, "", fmt.Errorf("FromModel: field %s: joins references undeclared join %q", f.Name, tableName)
+				}
+				extraJoins = append(extraJoins, jm)
+			}
 		case "filter":
-			if !hasValue || strings.TrimSpace(value) == "" {
+			if !hasValue || value == "" {
 				return FieldMeta{}, "", fmt.Errorf("FromModel: field %s: filter tag needs a list, e.g. filter:eq,contains", f.Name)
 			}
 			ops, err := parseOperatorList(value)
@@ -336,7 +440,6 @@ func buildFieldMeta(f reflect.StructField, tag, table string, join *JoinMeta) (F
 		case "nosearch":
 			searchable = false
 		case "column":
-			value = strings.TrimSpace(value)
 			if !hasValue || value == "" {
 				return FieldMeta{}, "", fmt.Errorf("FromModel: field %s: column tag needs a name, e.g. column:type_id", f.Name)
 			}
@@ -345,14 +448,13 @@ func buildFieldMeta(f reflect.StructField, tag, table string, join *JoinMeta) (F
 				name = value
 			}
 		case "name":
-			value = strings.TrimSpace(value)
 			if !hasValue || value == "" {
 				return FieldMeta{}, "", fmt.Errorf("FromModel: field %s: name tag needs a value, e.g. name:is_syariah", f.Name)
 			}
 			name = value
 			nameSet = true
 		default:
-			return FieldMeta{}, "", fmt.Errorf("FromModel: field %s: unknown tag part %q", f.Name, part)
+			return FieldMeta{}, "", fmt.Errorf("FromModel: field %s: unknown tag part %q", f.Name, p.raw)
 		}
 	}
 
@@ -367,6 +469,7 @@ func buildFieldMeta(f reflect.StructField, tag, table string, join *JoinMeta) (F
 	return FieldMeta{
 		Column:     column,
 		Join:       join,
+		Joins:      extraJoins,
 		Searchable: searchable,
 		Operators:  operators,
 	}, name, nil
@@ -386,31 +489,24 @@ func parseJoinTag(f reflect.StructField, tag string) (*JoinMeta, string, bool, e
 		jm       JoinMeta
 		leftover []string
 	)
-	for _, part := range strings.Split(tag, ";") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		key, value, _ := strings.Cut(part, ":")
-		value = strings.TrimSpace(value)
-
-		switch strings.ToLower(strings.TrimSpace(key)) {
+	for _, p := range splitTagParts(tag) {
+		switch p.key {
 		case "join":
 			isJoin = true
-			switch strings.ToLower(value) {
+			switch strings.ToLower(p.value) {
 			case "", "left":
 				jm.Type = "LEFT"
 			case "inner":
 				jm.Type = "INNER"
 			default:
-				return nil, "", false, fmt.Errorf("FromModel: field %s: unknown join type %q (want left or inner)", f.Name, value)
+				return nil, "", false, fmt.Errorf("FromModel: field %s: unknown join type %q (want left or inner)", f.Name, p.value)
 			}
 		case "table":
-			jm.Table = value
+			jm.Table = p.value
 		case "on":
-			jm.On = value
+			jm.On = p.value
 		default:
-			leftover = append(leftover, part)
+			leftover = append(leftover, p.raw)
 		}
 	}
 	if !isJoin {
