@@ -81,8 +81,8 @@ db.Scopes(scopes...).Find(&users)
 ## Schema from Struct Tags (`FromModel`)
 
 `FromModel` reflects over any model struct and builds the `ModelMeta`
-whitelist for you. Hand-written `ModelMeta` still works and is required for
-joined fields.
+whitelist for you. Hand-written `ModelMeta` still works, but flat fields and
+joined-table fields can now be declared directly on your entity structs.
 
 **Default (no `sqlgen` tag):** field is included with **all** filter
 operators, sortable and selectable. String fields are searchable by
@@ -96,15 +96,23 @@ restrict or adjust:
 | `filter:comparable` | `eq,ne,gt,gte,lt,lte,between` |
 | `filter:text` | `eq,contains,startswith,endswith` |
 | `search` / `nosearch` | Force field into / out of global search |
-| `column:custom_name` | Override the SQL column name |
+| `column:custom_name_or_expression` | Override the SQL column/expression; used verbatim |
+| `name:query_name` | Override the query-facing field name used by filters/sorts |
+| `join:left` / `join:inner` | Recurse into a nested struct and attach a LEFT/INNER join |
+| `table:table_or_alias` | Joined table declaration; required with `join` |
+| `on:join_condition` | Joined table ON condition; required with `join` |
 | `-` | Exclude the field from the schema entirely |
 
 Parts are separated by `;`, list items by `,`. Column name resolution:
 `sqlgen` `column:` override → `gorm:"column:..."` → snake_case of the Go
-field name (`TypeID` → `type_id`). The resolved column is also the
-query-facing field name used in filters/sorts. Embedded structs (e.g.
-`gorm.Model`) are recursed into; unexported fields are skipped; malformed
-tags and duplicate columns return an error.
+field name (`TypeID` → `type_id`). `Options.Table` qualifies root columns
+(`id` → `investment_products.id`) while field names stay bare (`id`).
+`column:` overrides are never qualified, so expressions like
+`COALESCE(mutual_fund_details.is_syariah, bond_details.is_syariah)` work.
+Embedded structs (e.g. `gorm.Model`) are recursed into; plain association
+structs/slices are skipped unless they carry a `join` tag; unexported fields
+are skipped; malformed tags and duplicate query-facing names return an
+error.
 
 ```go
 type Product struct {
@@ -112,11 +120,25 @@ type Product struct {
     TypeID     int    `sqlgen:"filter:eq,ne,in"`
     Name       string `sqlgen:"filter:text;search"`
     DataStatus string `sqlgen:"filter:eq,ne,in,notin;nosearch"`
+    Fund       FundDetail `sqlgen:"join:left;table:mutual_fund_details;on:mutual_fund_details.product_id = investment_products.id"`
+    Bond       *BondDetail `sqlgen:"join:left;table:bond_details;on:bond_details.product_id = investment_products.id"`
     Secret     string `sqlgen:"-"`
 }
 
+type FundDetail struct {
+    FundCategory      string `sqlgen:"filter:eq,in,contains,null,notnull;search"`
+    InvestmentManager string `sqlgen:"filter:eq,contains,startswith,null,notnull;search"`
+    IsSyariah bool `sqlgen:"name:is_syariah;column:COALESCE(mutual_fund_details.is_syariah, bond_details.is_syariah);filter:eq"`
+}
+
+type BondDetail struct {
+    BondType string `sqlgen:"filter:eq,in,contains,null,notnull;search"`
+    Issuer   string `sqlgen:"filter:eq,contains,startswith,null,notnull;search"`
+}
+
 gen, err := sql_generator.FromModel(&Product{}, sql_generator.Options{
-    DefaultFieldForSort: "id",
+    Table:               "investment_products",
+    DefaultFieldForSort: "investment_products.created_at",
     MaxFiltersPerQuery:  50,
 })
 ```

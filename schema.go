@@ -1,9 +1,11 @@
 package sql_generator
 
 import (
+	"database/sql/driver"
 	"fmt"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/susilo001/sql-generator/model"
 
@@ -21,6 +23,14 @@ const TagKey = "sqlgen"
 // The zero value is valid: no default sort field, ILIKE search, and no
 // limits.
 type Options struct {
+	// Table, when set, qualifies every root-level column with the table
+	// name (e.g. Table: "investment_products" turns column "id" into
+	// "investment_products.id"). Recommended whenever the schema declares
+	// joins, so base-table columns cannot collide with joined columns.
+	// Columns overridden via the `column:` tag part are used verbatim and
+	// never qualified.
+	Table string
+
 	// DefaultFieldForSort is copied to Generator.DefaultFieldForSort.
 	DefaultFieldForSort string
 
@@ -135,15 +145,51 @@ var operatorPresets = map[string][]model.Operator{
 // type_id). The resolved column name is also the query-facing field name
 // clients use in filters and sorts.
 //
+// Additional tag parts for real-world repository schemas:
+//
+//	name:query_name — override the query-facing field name clients use
+//	          in filters/sorts (defaults to the unqualified column name).
+//	          Use it when the SQL column is an expression or when two
+//	          joined tables share a column name.
+//
+// When Options.Table is set, every root-level column is qualified with
+// it ("id" → "investment_products.id") while the query-facing field name
+// stays unqualified ("id"). `column:` overrides are used verbatim — they
+// may be a qualified name or a full SQL expression such as
+// "COALESCE(a.x, b.x)" — and are never re-qualified.
+//
+// Joined tables are declared as nested struct fields carrying a join tag:
+//
+//	type InvestmentProduct struct {
+//		ID     int
+//		Name   string `sqlgen:"filter:text;search"`
+//		Fund   MutualFundDetail `sqlgen:"join:left;table:mutual_fund_details;on:mutual_fund_details.product_id = investment_products.id"`
+//		Bond   *BondDetail      `sqlgen:"join:left;table:bond_details;on:bond_details.product_id = investment_products.id"`
+//	}
+//
+//	type MutualFundDetail struct {
+//		FundCategory      string `sqlgen:"filter:eq,in,contains,null,notnull;search"`
+//		InvestmentManager string `sqlgen:"filter:eq,contains,startswith;search"`
+//	}
+//
+// Every leaf field inside a joined struct is qualified with the join's
+// table (alias if one is given, e.g. "mutual_fund_details f" → "f") and
+// carries a JoinMeta, so the Generator auto-applies the JOIN whenever the
+// field is referenced. join accepts "left" or "inner" (default "left");
+// table: and on: are required alongside it and are concatenated into the
+// SQL — they are developer-authored configuration, never request input.
+//
 // Embedded (anonymous) structs such as gorm.Model are recursed into;
-// unexported fields are skipped. Named struct fields (time.Time,
-// gorm.DeletedAt, sql.NullString, ...) are treated as leaf columns, not
-// recursed. Fields backed by joins must still be declared in a
-// hand-written ModelMeta — struct tags describe flat columns only.
+// unexported fields are skipped. Named struct fields WITHOUT a join tag
+// are included as leaf columns only when they are database-scalar types
+// (time.Time, gorm.DeletedAt, sql.NullString, driver.Valuer
+// implementations, ...); plain association structs/slices without a join
+// tag are skipped, since they have no single column.
 //
 // FromModel fails fast: a malformed tag (unknown operator alias, unknown
-// tag part, empty column override) or two fields resolving to the same
-// column name return an error rather than being silently skipped.
+// tag part, empty column/name override, join missing table/on, join tag
+// on a non-struct field) or two fields resolving to the same query-facing
+// name return an error rather than being silently skipped.
 func FromModel(m any, opts ...Options) (*Generator, error) {
 	t := reflect.TypeOf(m)
 	for t != nil && t.Kind() == reflect.Pointer {
@@ -153,17 +199,17 @@ func FromModel(m any, opts ...Options) (*Generator, error) {
 		return nil, fmt.Errorf("FromModel: expected a struct or pointer to struct, got %T", m)
 	}
 
+	var o Options
+	if len(opts) > 0 {
+		o = opts[0]
+	}
+
 	fields := map[string]FieldMeta{}
-	if err := collectFields(t, fields); err != nil {
+	if err := collectFields(t, fields, o.Table, nil); err != nil {
 		return nil, err
 	}
 	if len(fields) == 0 {
 		return nil, fmt.Errorf("FromModel: %s has no usable fields", t.Name())
-	}
-
-	var o Options
-	if len(opts) > 0 {
-		o = opts[0]
 	}
 
 	return &Generator{
@@ -183,9 +229,12 @@ func FromModel(m any, opts ...Options) (*Generator, error) {
 }
 
 // collectFields walks the struct type t and adds one FieldMeta per usable
-// field to out, recursing into embedded (anonymous) struct fields. It
-// returns an error on the first malformed tag or duplicate column name.
-func collectFields(t reflect.Type, out map[string]FieldMeta) error {
+// field to out, recursing into embedded (anonymous) structs and into
+// nested structs carrying a join tag. table qualifies plain column names
+// ("" leaves them unqualified); join, when non-nil, is attached to every
+// leaf field collected within that joined struct. It returns an error on
+// the first malformed tag or duplicate query-facing name.
+func collectFields(t reflect.Type, out map[string]FieldMeta, table string, join *JoinMeta) error {
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
 
@@ -195,12 +244,9 @@ func collectFields(t reflect.Type, out map[string]FieldMeta) error {
 		// the export check. Named struct fields (time.Time,
 		// gorm.DeletedAt, ...) are leaf columns, not recursed.
 		if f.Anonymous {
-			ft := f.Type
-			for ft.Kind() == reflect.Pointer {
-				ft = ft.Elem()
-			}
+			ft := derefType(f.Type)
 			if ft.Kind() == reflect.Struct {
-				if err := collectFields(ft, out); err != nil {
+				if err := collectFields(ft, out, table, join); err != nil {
 					return err
 				}
 				continue
@@ -216,23 +262,54 @@ func collectFields(t reflect.Type, out map[string]FieldMeta) error {
 			continue
 		}
 
-		meta, name, err := buildFieldMeta(f, tag)
+		// A join tag turns a nested struct field into a joined table:
+		// recurse into it with the join's table as the column qualifier
+		// and the JoinMeta attached to every leaf.
+		if jm, rest, ok, err := parseJoinTag(f, tag); err != nil {
+			return err
+		} else if ok {
+			if rest != "" {
+				return fmt.Errorf("FromModel: field %s: join tag cannot be combined with other parts (%q)", f.Name, rest)
+			}
+			ft := derefType(f.Type)
+			if ft.Kind() != reflect.Struct {
+				return fmt.Errorf("FromModel: field %s: join tag requires a struct field, got %s", f.Name, ft.Kind())
+			}
+			if err := collectFields(ft, out, joinQualifier(jm.Table), jm); err != nil {
+				return err
+			}
+			continue
+		}
+
+		// Plain association structs/slices without a join tag have no
+		// single column; skip them unless the type is database-scalar
+		// (time.Time, sql.NullString, driver.Valuer, ...).
+		if !isScalarType(f.Type) {
+			continue
+		}
+
+		meta, name, err := buildFieldMeta(f, tag, table, join)
 		if err != nil {
 			return err
 		}
 		if _, dup := out[name]; dup {
-			return fmt.Errorf("FromModel: duplicate column %q (field %s)", name, f.Name)
+			return fmt.Errorf("FromModel: duplicate field name %q (field %s); use name: to disambiguate", name, f.Name)
 		}
 		out[name] = meta
 	}
 	return nil
 }
 
-// buildFieldMeta parses one struct field's `sqlgen` tag and resolves its
-// column name, returning the FieldMeta and the query-facing field name
-// (which equals the resolved column).
-func buildFieldMeta(f reflect.StructField, tag string) (FieldMeta, string, error) {
-	column := resolveColumn(f)
+// buildFieldMeta parses one leaf field's `sqlgen` tag and resolves its
+// SQL column and query-facing field name. table, when non-empty,
+// qualifies the resolved column ("id" → "table.id") unless a column:
+// override is present, which is always used verbatim. join is attached
+// to the FieldMeta so the Generator auto-applies it.
+func buildFieldMeta(f reflect.StructField, tag, table string, join *JoinMeta) (FieldMeta, string, error) {
+	baseColumn := resolveColumn(f)
+	name := baseColumn
+	nameSet := false
+	columnOverride := ""
 	operators := presetOperatorSet("all")
 	searchable := isStringKind(f.Type)
 
@@ -263,17 +340,97 @@ func buildFieldMeta(f reflect.StructField, tag string) (FieldMeta, string, error
 			if !hasValue || value == "" {
 				return FieldMeta{}, "", fmt.Errorf("FromModel: field %s: column tag needs a name, e.g. column:type_id", f.Name)
 			}
-			column = value
+			columnOverride = value
+			if !nameSet {
+				name = value
+			}
+		case "name":
+			value = strings.TrimSpace(value)
+			if !hasValue || value == "" {
+				return FieldMeta{}, "", fmt.Errorf("FromModel: field %s: name tag needs a value, e.g. name:is_syariah", f.Name)
+			}
+			name = value
+			nameSet = true
 		default:
 			return FieldMeta{}, "", fmt.Errorf("FromModel: field %s: unknown tag part %q", f.Name, part)
 		}
 	}
 
+	column := columnOverride
+	if column == "" {
+		column = baseColumn
+		if table != "" {
+			column = table + "." + column
+		}
+	}
+
 	return FieldMeta{
 		Column:     column,
+		Join:       join,
 		Searchable: searchable,
 		Operators:  operators,
-	}, column, nil
+	}, name, nil
+}
+
+// parseJoinTag detects and parses the join form of a `sqlgen` tag:
+//
+//	join:left;table:mutual_fund_details;on:mutual_fund_details.product_id = investment_products.id
+//
+// It returns (join, leftoverParts, isJoin, error). leftoverParts contains
+// any tag parts other than join/table/on, which are invalid on a join
+// field. When the tag has no join: part, isJoin is false and the other
+// return values are zero.
+func parseJoinTag(f reflect.StructField, tag string) (*JoinMeta, string, bool, error) {
+	var (
+		isJoin   bool
+		jm       JoinMeta
+		leftover []string
+	)
+	for _, part := range strings.Split(tag, ";") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		key, value, _ := strings.Cut(part, ":")
+		value = strings.TrimSpace(value)
+
+		switch strings.ToLower(strings.TrimSpace(key)) {
+		case "join":
+			isJoin = true
+			switch strings.ToLower(value) {
+			case "", "left":
+				jm.Type = "LEFT"
+			case "inner":
+				jm.Type = "INNER"
+			default:
+				return nil, "", false, fmt.Errorf("FromModel: field %s: unknown join type %q (want left or inner)", f.Name, value)
+			}
+		case "table":
+			jm.Table = value
+		case "on":
+			jm.On = value
+		default:
+			leftover = append(leftover, part)
+		}
+	}
+	if !isJoin {
+		return nil, "", false, nil
+	}
+	if jm.Table == "" || jm.On == "" {
+		return nil, "", false, fmt.Errorf("FromModel: field %s: join tag requires table: and on: parts", f.Name)
+	}
+	return &jm, strings.Join(leftover, ";"), true, nil
+}
+
+// joinQualifier returns the identifier used to qualify a joined table's
+// columns: the alias when the table declaration carries one
+// ("mutual_fund_details f" → "f"), otherwise the table name itself.
+func joinQualifier(table string) string {
+	parts := strings.Fields(table)
+	if len(parts) == 0 {
+		return table
+	}
+	return parts[len(parts)-1]
 }
 
 // parseOperatorList expands a comma-separated list of operator aliases
@@ -335,8 +492,45 @@ func resolveColumn(f reflect.StructField) string {
 // which controls the default Searchable value for untagged fields: the
 // global search clause uses LIKE/ILIKE and is only valid on text columns.
 func isStringKind(t reflect.Type) bool {
+	return derefType(t).Kind() == reflect.String
+}
+
+// derefType unwraps pointer types down to their element type.
+func derefType(t reflect.Type) reflect.Type {
 	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
-	return t.Kind() == reflect.String
+	return t
+}
+
+// valuerType is the driver.Valuer interface, implemented by sql.Null*
+// wrappers, gorm.DeletedAt, decimal types, and similar database-scalar
+// struct types.
+var valuerType = reflect.TypeOf((*driver.Valuer)(nil)).Elem()
+
+// timeType is time.Time, special-cased because it does not implement
+// driver.Valuer yet always maps to a single column.
+var timeType = reflect.TypeOf(time.Time{})
+
+// isScalarType reports whether t (unwrapping pointers) maps to a single
+// database column: primitive kinds, []byte, time.Time, and struct types
+// implementing driver.Valuer. Association structs, slices, and maps do
+// not, and are skipped by collectFields unless declared with a join tag.
+func isScalarType(t reflect.Type) bool {
+	t = derefType(t)
+
+	switch t.Kind() {
+	case reflect.Bool,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Float32, reflect.Float64,
+		reflect.String:
+		return true
+	case reflect.Slice:
+		return t.Elem().Kind() == reflect.Uint8 // []byte
+	case reflect.Struct:
+		return t == timeType || t.Implements(valuerType) || reflect.PointerTo(t).Implements(valuerType)
+	default:
+		return false
+	}
 }

@@ -147,12 +147,12 @@ func TestFromModelRejectsMalformedTags(t *testing.T) {
 			want: "column tag needs a name",
 		},
 		{
-			name: "duplicate column",
+			name: "duplicate query-facing name",
 			model: struct {
-				A string `sqlgen:"column:name"`
-				B string `gorm:"column:name"`
+				A string `sqlgen:"name:name"`
+				B string `sqlgen:"name:name"`
 			}{},
-			want: "duplicate column",
+			want: "duplicate field name",
 		},
 	}
 
@@ -164,6 +164,166 @@ func TestFromModelRejectsMalformedTags(t *testing.T) {
 			}
 		})
 	}
+}
+
+// mutualFundDetail / bondDetail model the joined-table shape from a real
+// repository schema: nested structs with a join tag on the parent field.
+type mutualFundDetail struct {
+	FundCategory      string `sqlgen:"filter:eq,in,contains,null,notnull;search"`
+	InvestmentManager string `sqlgen:"filter:eq,contains,startswith,null,notnull;search"`
+	IsSyariah         bool   `sqlgen:"filter:eq;name:is_syariah;column:COALESCE(mutual_fund_details.is_syariah, bond_details.is_syariah)"`
+}
+
+type bondDetail struct {
+	BondType string `sqlgen:"filter:eq,in,contains,null,notnull;search"`
+	Issuer   string `sqlgen:"filter:eq,contains,startswith,null,notnull;search"`
+	IsRetail bool   `sqlgen:"filter:eq"`
+}
+
+type productType struct {
+	ID int
+}
+
+type investmentProduct struct {
+	ID         int              `sqlgen:"filter:eq,in"`
+	TenantCode string           `sqlgen:"filter:eq,in,contains;search"`
+	Name       string           `sqlgen:"filter:eq,contains,startswith;search"`
+	RiskLevel  int              `sqlgen:"filter:comparable"`
+	Type       *productType     // association without join tag: skipped
+	Tags       []string         // slice association: skipped
+	Fund       mutualFundDetail `sqlgen:"join:left;table:mutual_fund_details;on:mutual_fund_details.product_id = investment_products.id"`
+	Bond       *bondDetail      `sqlgen:"join:left;table:bond_details;on:bond_details.product_id = investment_products.id"`
+}
+
+func TestFromModelJoinsAndTableQualification(t *testing.T) {
+	gen, err := FromModel(&investmentProduct{}, Options{
+		Table:               "investment_products",
+		DefaultFieldForSort: "investment_products.created_at",
+		CaseSensitiveSearch: true,
+	})
+	if err != nil {
+		t.Fatalf("FromModel: %v", err)
+	}
+	fields := gen.Schema.Fields
+
+	// Root columns qualified with the base table; field names stay bare.
+	if got := fields["id"].Column; got != "investment_products.id" {
+		t.Fatalf("id column = %q", got)
+	}
+	if got := fields["tenant_code"].Column; got != "investment_products.tenant_code" {
+		t.Fatalf("tenant_code column = %q", got)
+	}
+
+	// Associations without a join tag are skipped.
+	if _, ok := fields["type"]; ok {
+		t.Fatalf("association Type should be skipped")
+	}
+	if _, ok := fields["tags"]; ok {
+		t.Fatalf("slice Tags should be skipped")
+	}
+
+	// Joined leaf fields: qualified with the join table + JoinMeta attached.
+	fc, ok := fields["fund_category"]
+	if !ok {
+		t.Fatalf("fund_category missing: %v", keys(fields))
+	}
+	if fc.Column != "mutual_fund_details.fund_category" {
+		t.Fatalf("fund_category column = %q", fc.Column)
+	}
+	if fc.Join == nil || fc.Join.Table != "mutual_fund_details" || fc.Join.Type != "LEFT" ||
+		fc.Join.On != "mutual_fund_details.product_id = investment_products.id" {
+		t.Fatalf("fund_category join = %+v", fc.Join)
+	}
+
+	// Pointer-to-struct joins work too.
+	if bt := fields["bond_type"]; bt.Join == nil || bt.Join.Table != "bond_details" {
+		t.Fatalf("bond_type join = %+v", fields["bond_type"].Join)
+	}
+
+	// name: + expression column: used verbatim, never re-qualified.
+	is, ok := fields["is_syariah"]
+	if !ok {
+		t.Fatalf("is_syariah missing: %v", keys(fields))
+	}
+	if is.Column != "COALESCE(mutual_fund_details.is_syariah, bond_details.is_syariah)" {
+		t.Fatalf("is_syariah column = %q", is.Column)
+	}
+	if !is.Operators[model.IsEqual] || is.Operators[model.IsContain] {
+		t.Fatalf("is_syariah operators = %#v", is.Operators)
+	}
+
+	// End-to-end: filtering on a joined field auto-applies the JOIN.
+	sql, _ := buildSQL(t, gen, model.Query{
+		SelectParameter: model.SelectParameter{
+			Filters: []model.Filter{
+				{FieldName: "fund_category", Operator: model.IsEqual, Value: "equity"},
+				{FieldName: "id", Operator: model.IsEqual, Value: 7},
+			},
+		},
+	})
+	for _, want := range []string{
+		"LEFT JOIN mutual_fund_details ON mutual_fund_details.product_id = investment_products.id",
+		"mutual_fund_details.fund_category = ?",
+		"investment_products.id = ?",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("SQL missing %q: %s", want, sql)
+		}
+	}
+}
+
+func TestFromModelJoinTagErrors(t *testing.T) {
+	tests := []struct {
+		name  string
+		model any
+		want  string
+	}{
+		{
+			name: "join missing on",
+			model: struct {
+				Fund mutualFundDetail `sqlgen:"join:left;table:mutual_fund_details"`
+			}{},
+			want: "join tag requires table: and on:",
+		},
+		{
+			name: "join on non-struct",
+			model: struct {
+				Name string `sqlgen:"join:left;table:t;on:t.id = x.id"`
+			}{},
+			want: "join tag requires a struct field",
+		},
+		{
+			name: "unknown join type",
+			model: struct {
+				Fund mutualFundDetail `sqlgen:"join:cross;table:t;on:t.id = x.id"`
+			}{},
+			want: "unknown join type",
+		},
+		{
+			name: "join mixed with filter",
+			model: struct {
+				Fund mutualFundDetail `sqlgen:"join:left;table:t;on:t.id = x.id;filter:eq"`
+			}{},
+			want: "cannot be combined",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := FromModel(tt.model)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("FromModel error = %v, want contains %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func keys(m map[string]FieldMeta) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }
 
 func TestFromModelRequiresStruct(t *testing.T) {
