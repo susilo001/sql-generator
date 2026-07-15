@@ -463,65 +463,77 @@ func SearchUsers(c *gin.Context) {
 }
 ```
 
-### HTTP Handler Example
+### Layered Example: Handler → Usecase → Repository
+
+`model.Query` is a plain value, so it travels through your layers like any
+other request DTO. The handler only parses the URL; the repository is the
+only place that knows about `Generator` and GORM.
 
 ```go
+// --- handler layer: parse the URL, delegate, encode the response ---
 import (
-    sql_generator "github.com/susilo001/sql-generator"
     "github.com/susilo001/sql-generator/binding"
     "github.com/gin-gonic/gin"
 )
 
-// URL query parameter parsing (recommended)
 func SearchUsers(c *gin.Context) {
-    // Parse URL query parameters: ?search=john&filter=status:active:equals&sort=name:asc
-    query, err := binding.ParseRequest(c.Request)
+    // GET /users?search=john&filter=status:active:equals&sort=name:asc
+    query, err := binding.ParseRequest(c.Request, nil)
     if err != nil {
         c.JSON(400, gin.H{"error": err.Error()})
         return
     }
-    
-    scopes, err := generator.Scopes(query)
+
+    users, total, err := userUsecase.SearchUsers(c.Request.Context(), query)
     if err != nil {
         c.JSON(400, gin.H{"error": err.Error()})
         return
     }
-    
-    var users []User
-    var total int64
-    
-    // Get total count
-    db.Model(&User{}).Scopes(scopes[:len(scopes)-1]...).Count(&total)
-    
-    // Get paginated results
-    db.Scopes(scopes...).Find(&users)
-    
+
     c.JSON(200, gin.H{
         "data":  users,
         "total": total,
         "page":  query.SelectParameter.PageDescriptor.Page,
     })
 }
+```
 
-// Alternative: JSON body parsing
-func SearchUsersJSON(c *gin.Context) {
-    var query model.Query
-    if err := c.ShouldBindJSON(&query); err != nil {
-        c.JSON(400, gin.H{"error": err.Error()})
-        return
-    }
-    
-    scopes, err := generator.Scopes(query)
-    if err != nil {
-        c.JSON(400, gin.H{"error": err.Error()})
-        return
-    }
-    
-    var users []User
-    db.Scopes(scopes...).Find(&users)
-    c.JSON(200, users)
+```go
+// --- usecase/service layer: business rules, no GORM/generator import ---
+func (u *UserUsecase) SearchUsers(ctx context.Context, q model.Query) ([]User, int64, error) {
+    // e.g. enforce a max PageSize, inject tenant-scoped filters, etc.
+    return u.userRepo.List(ctx, q)
 }
 ```
+
+```go
+// --- repository layer: owns the Generator/schema, generates SQL ---
+var userListGenerator = &sql_generator.Generator{
+    Schema:              &sql_generator.ModelMeta{ /* ... */ },
+    DefaultFieldForSort: "id",
+    MaxFiltersPerQuery:  50,
+}
+
+func (r *UserRepository) List(ctx context.Context, q model.Query) ([]User, int64, error) {
+    scopes, err := userListGenerator.Scopes(q)
+    if err != nil {
+        return nil, 0, err
+    }
+
+    var users []User
+    var total int64
+    r.db.WithContext(ctx).Model(&User{}).Scopes(scopes[:len(scopes)-1]...).Count(&total)
+    if err := r.db.WithContext(ctx).Scopes(scopes...).Find(&users).Error; err != nil {
+        return nil, 0, err
+    }
+    return users, total, nil
+}
+```
+
+> **Alternative:** if a caller must send `model.Query` in a JSON body
+> instead of a URL, decode it with `c.ShouldBindJSON(&query)` in the
+> handler and pass it to the same usecase — the usecase/repository layers
+> don't change either way.
 
 ## Best Practices
 
