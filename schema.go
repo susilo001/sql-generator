@@ -408,53 +408,28 @@ func buildFieldMeta(f reflect.StructField, tag, table string, join *JoinMeta, jo
 	var extraJoins []JoinMeta
 
 	for _, p := range splitTagParts(tag) {
-		key, value, hasValue := p.key, p.value, p.hasValue
-
-		switch key {
-		case "joins":
-			if !hasValue || value == "" {
-				return FieldMeta{}, "", fmt.Errorf("FromModel: field %s: joins tag needs a list, e.g. joins:bond_details", f.Name)
-			}
-			for _, tableName := range strings.Split(value, ",") {
-				tableName = strings.TrimSpace(tableName)
-				if tableName == "" {
-					continue
-				}
-				jm, ok := joinRegistry[tableName]
-				if !ok {
-					return FieldMeta{}, "", fmt.Errorf("FromModel: field %s: joins references undeclared join %q", f.Name, tableName)
-				}
-				extraJoins = append(extraJoins, jm)
-			}
-		case "filter":
-			if !hasValue || value == "" {
-				return FieldMeta{}, "", fmt.Errorf("FromModel: field %s: filter tag needs a list, e.g. filter:eq,contains", f.Name)
-			}
-			ops, err := parseOperatorList(value)
-			if err != nil {
-				return FieldMeta{}, "", fmt.Errorf("FromModel: field %s: %w", f.Name, err)
-			}
-			operators = ops
-		case "search":
-			searchable = true
-		case "nosearch":
-			searchable = false
-		case "column":
-			if !hasValue || value == "" {
-				return FieldMeta{}, "", fmt.Errorf("FromModel: field %s: column tag needs a name, e.g. column:type_id", f.Name)
-			}
-			columnOverride = value
+		result, err := parseFieldPart(p, f, table, joinRegistry)
+		if err != nil {
+			return FieldMeta{}, "", err
+		}
+		if result.Operators != nil {
+			operators = result.Operators
+		}
+		if result.Searchable != nil {
+			searchable = *result.Searchable
+		}
+		if result.Column != nil {
+			columnOverride = *result.Column
 			if !nameSet {
-				name = value
+				name = *result.Column
 			}
-		case "name":
-			if !hasValue || value == "" {
-				return FieldMeta{}, "", fmt.Errorf("FromModel: field %s: name tag needs a value, e.g. name:is_syariah", f.Name)
-			}
-			name = value
+		}
+		if result.Name != nil {
+			name = *result.Name
 			nameSet = true
-		default:
-			return FieldMeta{}, "", fmt.Errorf("FromModel: field %s: unknown tag part %q", f.Name, p.raw)
+		}
+		if len(result.ExtraJoins) > 0 {
+			extraJoins = result.ExtraJoins
 		}
 	}
 
@@ -490,23 +465,23 @@ func parseJoinTag(f reflect.StructField, tag string) (*JoinMeta, string, bool, e
 		leftover []string
 	)
 	for _, p := range splitTagParts(tag) {
-		switch p.key {
-		case "join":
-			isJoin = true
-			switch strings.ToLower(p.value) {
-			case "", "left":
-				jm.Type = "LEFT"
-			case "inner":
-				jm.Type = "INNER"
-			default:
-				return nil, "", false, fmt.Errorf("FromModel: field %s: unknown join type %q (want left or inner)", f.Name, p.value)
-			}
-		case "table":
-			jm.Table = p.value
-		case "on":
-			jm.On = p.value
-		default:
+		result, err := parseJoinPart(p)
+		if err != nil {
+			return nil, "", false, fmt.Errorf("FromModel: field %s: %w", f.Name, err)
+		}
+		if result.IsLeftover {
 			leftover = append(leftover, p.raw)
+			continue
+		}
+		if result.JoinType != nil {
+			isJoin = true
+			jm.Type = *result.JoinType
+		}
+		if result.Table != nil {
+			jm.Table = *result.Table
+		}
+		if result.On != nil {
+			jm.On = *result.On
 		}
 	}
 	if !isJoin {
