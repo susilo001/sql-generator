@@ -12,8 +12,7 @@ A flexible, type-safe Go package for generating dynamic GORM queries from fronte
 ✅ **Field Projection** - SELECT specific columns  
 ✅ **Automatic Joins** - Auto-apply joins based on requested fields  
 ✅ **Eager Loading** - Preload relationships  
-✅ **Soft Delete Support** - Include/exclude soft-deleted records  
-✅ **DISTINCT Queries** - Remove duplicates  
+✅ **URL Query Parsing** - Read filters/sort/pagination directly from a URL, no body decode needed  
 ✅ **Query Validation** - Configurable limits and security  
 ✅ **Case-Sensitive Search** - Database-agnostic search configuration  
 
@@ -77,6 +76,10 @@ if err != nil {
 var users []User
 db.Scopes(scopes...).Find(&users)
 ```
+
+> This example builds `model.Query` by hand. In an HTTP handler, you'll
+> typically parse it from the incoming URL query string instead — see
+> [URL Query Parameter Format](#url-query-parameter-format) below.
 
 ## Schema from Struct Tags (`FromModel`)
 
@@ -272,21 +275,7 @@ query := model.Query{
 }
 ```
 
-### Soft Delete Support
 
-```go
-query := model.Query{
-    IncludeDeleted: true, // Include soft-deleted records (GORM Unscoped)
-}
-```
-
-### DISTINCT Queries
-
-```go
-query := model.Query{
-    Distinct: true, // Apply DISTINCT
-}
-```
 
 ### Multi-field Sorting
 
@@ -374,7 +363,67 @@ if err != nil {
 
 ## Frontend Integration Example
 
-### JSON Request Format
+### URL Query Parameter Format
+
+The `binding` package parses URL query parameters directly into `model.Query`:
+
+```
+GET /api/users?search=john&filter=status:active:equals|age:25:greaterthan&sort=name:asc&page=1&pageSize=20
+```
+
+**Query Parameter Format:**
+
+| Parameter | Format | Example |
+|---|---|---|
+| `search` | `search=term` | `search=john` |
+| `filter` | `field:value:operator\|...` | `status:active:equals\|age:25:greaterthan` |
+| `sort` | `field:direction\|...` | `name:asc\|created_at:desc` |
+| `page` | `page=N` | `page=1` |
+| `pageSize` | `pageSize=N` | `pageSize=20` |
+| `fields` | comma-separated | `fields=id,name,email` |
+| `preloads` | comma-separated | `preloads=Profile,Posts` |
+
+**Operator Aliases (case-insensitive):**
+
+| Alias | Operator |
+|---|---|
+| `equals` | `IS_EQUAL` |
+| `notequals` | `IS_NOT_EQUAL` |
+| `greaterthan` | `IS_MORE_THAN` |
+| `greaterthanorequal` | `IS_MORE_THAN_OR_EQUAL` |
+| `lessthan` | `IS_LESS_THAN` |
+| `lessthanorequal` | `IS_LESS_THAN_OR_EQUAL` |
+| `contains` | `IS_CONTAIN` |
+| `startswith` | `IS_BEGIN_WITH` |
+| `endswith` | `IS_END_WITH` |
+| `isin` | `IS_IN` (comma-separated values) |
+| `isnotin` | `IS_NOT_IN` (comma-separated values) |
+
+**Usage with `binding` package:**
+
+```go
+import "github.com/susilo001/sql-generator/binding"
+
+func SearchUsers(c *gin.Context) {
+    query, err := binding.ParseRequest(c.Request)
+    if err != nil {
+        c.JSON(400, gin.H{"error": err.Error()})
+        return
+    }
+    
+    scopes, err := generator.Scopes(query)
+    if err != nil {
+        c.JSON(400, gin.H{"error": err.Error()})
+        return
+    }
+    
+    var users []User
+    db.Scopes(scopes...).Find(&users)
+    c.JSON(200, users)
+}
+```
+
+### JSON Request Format (Alternative)
 
 ```json
 {
@@ -410,18 +459,24 @@ if err != nil {
     },
     "fields": ["id", "name", "email"],
     "preloads": ["Profile", "Posts"]
-  },
-  "includeDeleted": false,
-  "distinct": false
+  }
 }
 ```
 
 ### HTTP Handler Example
 
 ```go
+import (
+    sql_generator "github.com/susilo001/sql-generator"
+    "github.com/susilo001/sql-generator/binding"
+    "github.com/gin-gonic/gin"
+)
+
+// URL query parameter parsing (recommended)
 func SearchUsers(c *gin.Context) {
-    var query model.Query
-    if err := c.ShouldBindJSON(&query); err != nil {
+    // Parse URL query parameters: ?search=john&filter=status:active:equals&sort=name:asc
+    query, err := binding.ParseRequest(c.Request)
+    if err != nil {
         c.JSON(400, gin.H{"error": err.Error()})
         return
     }
@@ -446,6 +501,25 @@ func SearchUsers(c *gin.Context) {
         "total": total,
         "page":  query.SelectParameter.PageDescriptor.Page,
     })
+}
+
+// Alternative: JSON body parsing
+func SearchUsersJSON(c *gin.Context) {
+    var query model.Query
+    if err := c.ShouldBindJSON(&query); err != nil {
+        c.JSON(400, gin.H{"error": err.Error()})
+        return
+    }
+    
+    scopes, err := generator.Scopes(query)
+    if err != nil {
+        c.JSON(400, gin.H{"error": err.Error()})
+        return
+    }
+    
+    var users []User
+    db.Scopes(scopes...).Find(&users)
+    c.JSON(200, users)
 }
 ```
 
