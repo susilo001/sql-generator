@@ -233,68 +233,20 @@ func (g *Generator) filterScopes(q model.Query) ([]func(*gorm.DB) *gorm.DB, erro
 			return nil, fmt.Errorf("operator not allowed: %s", f.Operator)
 		}
 
-		col := meta.Column
-		op := f.Operator
-		val := f.Value
-		rng := f.RangeValues
-
 		// Validate BEFORE creating scope
-		if op == model.IsBetween && len(rng) != 2 {
+		if f.Operator == model.IsBetween && len(f.RangeValues) != 2 {
 			return nil, fmt.Errorf("IS_BETWEEN requires exactly 2 values")
 		}
 		if err := g.validateRangeValues(f); err != nil {
 			return nil, err
 		}
 
+		sql, args := g.buildFilterCondition(meta.Column, f)
 		scope := func(db *gorm.DB) *gorm.DB {
-			switch op {
-
-			case model.IsEqual:
-				return db.Where(col+" = ?", val)
-
-			case model.IsNotEqual:
-				return db.Where(col+" <> ?", val)
-
-			case model.IsLessThan:
-				return db.Where(col+" < ?", val)
-
-			case model.IsMoreThan:
-				return db.Where(col+" > ?", val)
-
-			case model.IsLessThanOrEqual:
-				return db.Where(col+" <= ?", val)
-
-			case model.IsMoreThanOrEqual:
-				return db.Where(col+" >= ?", val)
-
-			case model.IsContain:
-				return db.Where(col+" LIKE ?", "%"+fmt.Sprint(val)+"%")
-
-			case model.IsBeginWith:
-				return db.Where(col+" LIKE ?", fmt.Sprint(val)+"%")
-
-			case model.IsEndWith:
-				return db.Where(col+" LIKE ?", "%"+fmt.Sprint(val))
-
-			case model.IsBetween:
-				return db.Where(col+" BETWEEN ? AND ?", rng[0], rng[1])
-
-			case model.IsIn:
-				return db.Where(col+" IN ?", rng)
-
-			case model.IsNotIn:
-				return db.Where(col+" NOT IN ?", rng)
-
-			case model.IsNull:
-				return db.Where(col + " IS NULL")
-
-			case model.IsNotNull:
-				return db.Where(col + " IS NOT NULL")
-
-			default:
-				// unreachable due to earlier validation
+			if sql == "" {
 				return db
 			}
+			return db.Where(sql, args...)
 		}
 
 		scopes = append(scopes, scope)
@@ -621,14 +573,14 @@ func (g *Generator) buildFilterGroupSQL(fg model.FilterGroup) (string, []any, er
 
 // buildFilterCondition returns the parameterized SQL fragment and its bound
 // arguments for a single Filter against the already-resolved column col.
-// This is the single source of truth for operator-to-SQL translation shared
-// by both buildFilterGroupSQL (nested groups) and, in spirit, filterScopes
-// (flat filters use an equivalent inline switch). Callers are expected to
-// have already validated f.Operator against the field's whitelist and, for
-// IS_BETWEEN, that f.RangeValues has exactly two elements — this function
-// does not re-validate and returns ("", nil) for an IS_BETWEEN filter with
-// the wrong number of RangeValues, or for any operator it does not
-// recognize.
+// This is the single source of truth for operator-to-SQL translation,
+// called by both filterScopes (flat filters) and buildFilterGroupSQL
+// (nested groups) so the 14-operator mapping is written exactly once.
+// Callers are expected to have already validated f.Operator against the
+// field's whitelist and, for IS_BETWEEN, that f.RangeValues has exactly two
+// elements — this function does not re-validate and returns ("", nil) for
+// an IS_BETWEEN filter with the wrong number of RangeValues, or for any
+// operator it does not recognize.
 func (g *Generator) buildFilterCondition(col string, f model.Filter) (string, []any) {
 	switch f.Operator {
 	case model.IsEqual:
