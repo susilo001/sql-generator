@@ -354,35 +354,27 @@ func (g *Generator) paginationScope(q model.Query) func(*gorm.DB) *gorm.DB {
 // returns an error describing which limit was exceeded, or nil if q is
 // within bounds.
 func (g *Generator) validateQuery(q model.Query) error {
-	if g.MaxFiltersPerQuery > 0 {
-		totalFilters := len(q.SelectParameter.Filters)
-		for _, fg := range q.SelectParameter.FilterGroups {
-			totalFilters += g.countFiltersInGroup(fg)
-		}
-		if totalFilters > g.MaxFiltersPerQuery {
-			return fmt.Errorf("too many filters: %d (max: %d)", totalFilters, g.MaxFiltersPerQuery)
-		}
+	totalFilters := len(q.SelectParameter.Filters)
+	totalGroups := 0
+	for _, fg := range q.SelectParameter.FilterGroups {
+		totalFilters += g.countFiltersInGroup(fg)
+		totalGroups += g.countGroups(fg)
 	}
-
-	if g.MaxSortsPerQuery > 0 && len(q.SelectParameter.Sorts) > g.MaxSortsPerQuery {
-		return fmt.Errorf("too many sorts: %d (max: %d)", len(q.SelectParameter.Sorts), g.MaxSortsPerQuery)
+	if err := checkLimit(g.MaxFiltersPerQuery, totalFilters, "filters"); err != nil {
+		return err
+	}
+	if err := checkLimit(g.MaxSortsPerQuery, len(q.SelectParameter.Sorts), "sorts"); err != nil {
+		return err
+	}
+	if err := checkLimit(g.MaxFilterGroupsPerQuery, totalGroups, "filter groups"); err != nil {
+		return err
 	}
 
 	if g.MaxFilterGroupDepth > 0 {
 		for _, fg := range q.SelectParameter.FilterGroups {
-			if depth := g.filterGroupDepth(fg); depth > g.MaxFilterGroupDepth {
-				return fmt.Errorf("filter groups nested too deeply: %d (max: %d)", depth, g.MaxFilterGroupDepth)
+			if err := checkLimit(g.MaxFilterGroupDepth, g.filterGroupDepth(fg), "filter group nesting depth"); err != nil {
+				return err
 			}
-		}
-	}
-
-	if g.MaxFilterGroupsPerQuery > 0 {
-		totalGroups := 0
-		for _, fg := range q.SelectParameter.FilterGroups {
-			totalGroups += g.countGroups(fg)
-		}
-		if totalGroups > g.MaxFilterGroupsPerQuery {
-			return fmt.Errorf("too many filter groups: %d (max: %d)", totalGroups, g.MaxFilterGroupsPerQuery)
 		}
 	}
 
@@ -394,6 +386,15 @@ func (g *Generator) validateQuery(q model.Query) error {
 		}
 	}
 
+	return nil
+}
+
+// checkLimit returns an error naming label if actual exceeds limit. A
+// limit of 0 or less means unlimited, so it always passes.
+func checkLimit(limit, actual int, label string) error {
+	if limit > 0 && actual > limit {
+		return fmt.Errorf("too many %s: %d (max: %d)", label, actual, limit)
+	}
 	return nil
 }
 
