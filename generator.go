@@ -36,6 +36,8 @@ import (
 // FilterGroups) or silently skip that entry (for Sorts and
 // SelectParameter.Fields).
 type ModelMeta struct {
+	// AllowedSorts restricts sortable fields in strict mode when non-nil.
+	AllowedSorts map[string]bool
 	// Fields maps a query-facing field name (e.g. "user_name") to its
 	// column, join, and operator metadata. Keys are matched exactly against
 	// Filter.FieldName, Sort.FieldName, and SelectParameter.Fields entries.
@@ -54,6 +56,8 @@ type ModelMeta struct {
 // underlying SQL column, which filter operators are permitted against it,
 // and whether it participates in global search.
 type FieldMeta struct {
+	// ValueType optionally converts and validates filter values: string, int, float64.
+	ValueType string
 	// Column is the SQL column reference used when building WHERE, ORDER BY,
 	// and SELECT clauses (e.g. "status" or "users.name" for a joined
 	// table). This value is concatenated directly into SQL strings, so it
@@ -111,9 +115,16 @@ type JoinMeta struct {
 // input is passed as a parameter to Scopes, never stored on the Generator
 // itself.
 type Generator struct {
-	// Schema is the field whitelist and join metadata every Query is
-	// validated against. Required: Scopes dereferences Schema and will
-	// panic with a nil-pointer error if it is left nil.
+	// StrictQueries rejects invalid sorts, selections and pagination instead of defaulting or skipping.
+	StrictQueries bool
+	// PortableSearch uses LOWER(column) LIKE for case-insensitive search on every driver.
+	PortableSearch bool
+	// TieBreakerField names a schema field appended to ordering when absent.
+	TieBreakerField string
+	// MaxOffset bounds pagination offsets; zero leaves only the integer overflow guard.
+	MaxOffset int
+	// Schema is the required field whitelist and join metadata. A missing
+	// schema returns a validation error before scopes are constructed.
 	Schema *ModelMeta
 
 	// DefaultFieldForSort is the column used to order results when the
@@ -126,7 +137,8 @@ type Generator struct {
 	// IsBeginWith, IsEndWith always use plain LIKE). When false (the zero
 	// value), search uses ILIKE, which is PostgreSQL-specific — other SQL
 	// dialects do not support ILIKE and will return a driver error. When
-	// true, search uses standard LIKE.
+	// true, search uses standard LIKE. PortableSearch uses LOWER(column)
+	// LIKE instead of ILIKE when case-insensitive search is requested.
 	CaseSensitiveSearch bool
 
 	// MaxFiltersPerQuery caps the total number of Filter entries allowed in
@@ -155,8 +167,8 @@ type Generator struct {
 	MaxFilterGroupsPerQuery int
 
 	// MaxPageSize caps SelectParameter.PageDescriptor.PageSize. A request
-	// asking for more rows than this is clamped down to MaxPageSize, not
-	// rejected. Zero (the default) means no upper bound, preserving the
+	// asking for more rows than this is clamped down unless StrictQueries
+	// is enabled, in which case it is rejected. Zero means no upper bound, preserving the
 	// previous behavior.
 	MaxPageSize int
 
@@ -185,14 +197,15 @@ type Generator struct {
 // references a field not declared in g.Schema, if a Filter's Operator is not
 // whitelisted for its field, or if an IS_BETWEEN filter does not carry
 // exactly two RangeValues. Unknown fields in Sorts and SelectParameter.Fields
-// are not errors — they are silently skipped (see sortScope, selectScope).
+// are silently skipped unless StrictQueries is enabled. Strict queries also
+// validate pagination and configured AllowedSorts before constructing scopes.
 func (g *Generator) Scopes(q model.Query) ([]func(*gorm.DB) *gorm.DB, error) {
-	var scopes []func(*gorm.DB) *gorm.DB
-
-	// Apply query limits validation
-	if err := g.validateQuery(q); err != nil {
+	var err error
+	q, err = g.Prepare(q)
+	if err != nil {
 		return nil, err
 	}
+	var scopes []func(*gorm.DB) *gorm.DB
 
 	fs, err := g.filterScopes(q)
 	if err != nil {
@@ -278,7 +291,14 @@ func (g *Generator) searchScope(q model.Query) func(*gorm.DB) *gorm.DB {
 
 		for _, f := range g.Schema.Fields {
 			if f.Searchable {
-				ors = append(ors, f.Column+" "+likeOp+" ?")
+				if g.PortableSearch && !g.CaseSensitiveSearch {
+					ors = append(ors, "LOWER("+f.Column+") LIKE ?")
+				} else {
+					ors = append(ors, f.Column+" "+likeOp+" ?")
+				}
+				if g.PortableSearch && !g.CaseSensitiveSearch {
+					term = "%" + strings.ToLower(q.Search) + "%"
+				}
 				args = append(args, term)
 			}
 		}
@@ -301,7 +321,9 @@ func (g *Generator) searchScope(q model.Query) func(*gorm.DB) *gorm.DB {
 func (g *Generator) sortScope(q model.Query) func(*gorm.DB) *gorm.DB {
 	return func(db *gorm.DB) *gorm.DB {
 		if len(q.SelectParameter.Sorts) == 0 {
-			return db.Order(g.DefaultFieldForSort + " ASC")
+			if g.DefaultFieldForSort != "" {
+				db = db.Order(g.DefaultFieldForSort + " ASC")
+			}
 		}
 
 		for _, s := range q.SelectParameter.Sorts {
@@ -316,6 +338,16 @@ func (g *Generator) sortScope(q model.Query) func(*gorm.DB) *gorm.DB {
 			}
 
 			db = db.Order(meta.Column + " " + dir)
+		}
+		if g.TieBreakerField != "" {
+			for _, sort := range q.SelectParameter.Sorts {
+				if sort.FieldName == g.TieBreakerField {
+					return db
+				}
+			}
+			if len(q.SelectParameter.Sorts) != 0 || g.DefaultFieldForSort != g.Schema.Fields[g.TieBreakerField].Column {
+				db = db.Order(g.Schema.Fields[g.TieBreakerField].Column + " ASC")
+			}
 		}
 
 		return db
@@ -354,6 +386,9 @@ func (g *Generator) paginationScope(q model.Query) func(*gorm.DB) *gorm.DB {
 // returns an error describing which limit was exceeded, or nil if q is
 // within bounds.
 func (g *Generator) validateQuery(q model.Query) error {
+	if g.Schema == nil {
+		return fmt.Errorf("query schema is required")
+	}
 	totalFilters := len(q.SelectParameter.Filters)
 	totalGroups := 0
 	for _, fg := range q.SelectParameter.FilterGroups {

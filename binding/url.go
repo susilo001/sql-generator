@@ -45,6 +45,8 @@ var DefaultOpAliases = map[string]model.Operator{
 // OpAliases fully REPLACES the default alias map when non-nil.
 // Pass nil to use DefaultOpAliases.
 type URLParseOptions struct {
+	// StrictPagination rejects explicitly supplied nonpositive or empty pagination.
+	StrictPagination bool
 	// Separators
 	FilterSep    string // between filter clauses. Default "|"
 	FilterTriple string // inside a filter clause. Default ":"
@@ -159,17 +161,23 @@ func ParseValues(v url.Values, opts *URLParseOptions) (model.Query, error) {
 		Search: v.Get(opts.SearchKey),
 	}
 
-	if s := v.Get(opts.PageKey); s != "" {
+	if s := v.Get(opts.PageKey); s != "" || (opts.StrictPagination && v.Has(opts.PageKey)) {
 		n, err := strconv.Atoi(s)
 		if err != nil {
 			return q, fmt.Errorf("binding: %s must be integer: %w", opts.PageKey, err)
 		}
+		if opts.StrictPagination && n < 1 {
+			return q, fmt.Errorf("binding: %s must be a positive integer", opts.PageKey)
+		}
 		q.SelectParameter.PageDescriptor.Page = n
 	}
-	if s := v.Get(opts.PageSizeKey); s != "" {
+	if s := v.Get(opts.PageSizeKey); s != "" || (opts.StrictPagination && v.Has(opts.PageSizeKey)) {
 		n, err := strconv.Atoi(s)
 		if err != nil {
 			return q, fmt.Errorf("binding: %s must be integer: %w", opts.PageSizeKey, err)
+		}
+		if opts.StrictPagination && n < 1 {
+			return q, fmt.Errorf("binding: %s must be a positive integer", opts.PageSizeKey)
 		}
 		q.SelectParameter.PageDescriptor.PageSize = n
 	}
@@ -182,7 +190,7 @@ func ParseValues(v url.Values, opts *URLParseOptions) (model.Query, error) {
 		q.SelectParameter.Sorts = sorts
 	}
 
-	if raw := v.Get(opts.FilterKey); raw != "" {
+	if raw := strings.Join(v[opts.FilterKey], opts.FilterSep); raw != "" {
 		filters, err := parseFilters(raw, opts)
 		if err != nil {
 			return q, err

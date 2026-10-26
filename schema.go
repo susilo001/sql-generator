@@ -56,6 +56,11 @@ func splitTagParts(tag string) []tagPart {
 // The zero value is valid: no default sort field, ILIKE search, and no
 // limits.
 type Options struct {
+	StrictQueries   bool
+	PortableSearch  bool
+	TieBreakerField string
+	MaxOffset       int
+	AllowedSorts    map[string]bool
 	// Table, when set, qualifies every root-level column with the table
 	// name (e.g. Table: "investment_products" turns column "id" into
 	// "investment_products.id"). Recommended whenever the schema declares
@@ -259,7 +264,12 @@ func FromModel(m any, opts ...Options) (*Generator, error) {
 	}
 
 	return &Generator{
+		StrictQueries:   o.StrictQueries,
+		PortableSearch:  o.PortableSearch,
+		TieBreakerField: o.TieBreakerField,
+		MaxOffset:       o.MaxOffset,
 		Schema: &ModelMeta{
+			AllowedSorts:    o.AllowedSorts,
 			Fields:          fields,
 			AllowedPreloads: o.AllowedPreloads,
 		},

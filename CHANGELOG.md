@@ -2,6 +2,14 @@
 
 All notable changes to sql-generator will be documented in this file.
 
+## [1.5.0] - 2026-10-26
+
+- Added opt-in strict query validation, typed filter values, bounded offsets,
+  portable case-insensitive search, explicit sort allow-lists and stable tie-breakers.
+- Added Prepare and CountScopes for validated requests and unpaginated totals.
+- Added strict HTTP pagination and repeated URL filter parameters.
+- Restored the Go 1.23 baseline and compatible dependency versions.
+
 ## [1.4.0] - 2026-07-13
 
 ### Features

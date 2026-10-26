@@ -16,6 +16,31 @@ A flexible, type-safe Go package for generating dynamic GORM queries from fronte
 ✅ **Query Validation** - Configurable limits and security  
 ✅ **Case-Sensitive Search** - Database-agnostic search configuration  
 
+## Strict list queries
+
+Opt into strict repository contracts with `Generator.StrictQueries`.
+Configure `ModelMeta.AllowedSorts` and a non-nil `AllowedPreloads` map
+(an empty map denies all preloads). Set `FieldMeta.ValueType` to
+`string`, `int` or `float64` for typed filter validation; float values must
+be finite. Untyped fields preserve their existing behavior.
+
+`MaxPageSize` rejects oversized requests in strict mode instead of clamping.
+`MaxOffset` rejects excessive offsets before multiplication.
+`TieBreakerField` names a schema field appended to ordering when absent.
+`PortableSearch` enables `LOWER(column) LIKE ?` for case-insensitive search
+across GORM drivers. Existing defaults remain unchanged.
+
+`Prepare(query)` validates and normalizes a query without mutating its slices.
+`Scopes(query)` applies the full list query; `CountScopes(query)` applies only
+filters, joins and search so totals exclude pagination, ordering, projection
+and preloads. Use separate GORM sessions for the count and page.
+
+The binding package accepts `field:value:operator` filters separated by `|`
+and repeated `filter` parameters. Set `URLParseOptions.StrictPagination` to
+reject explicitly empty or nonpositive page/page-size values. Direct Go zero
+pagination still selects the defaults. Custom query keys such as `page_size`
+and `preload` are supported. The module targets Go 1.23.
+
 ## Installation
 
 ```bash

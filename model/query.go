@@ -61,8 +61,8 @@ type SelectParameter struct {
 	// skipped.
 	Fields []string `json:"fields"`
 
-	// Preloads lists GORM association names to eager-load via
-	// db.Preload. Names are passed through to GORM as-is and are not
-	// validated against the schema.
+	// Preloads lists GORM association names to eager-load via db.Preload.
+	// A non-nil ModelMeta.AllowedPreloads map restricts allowed names;
+	// nil preserves unrestricted pass-through behavior.
 	Preloads []string `json:"preloads"`
 }
