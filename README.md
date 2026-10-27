@@ -44,6 +44,13 @@ empty filter, sort, field and preload clauses, as well as repeated single-value
 query parameters; repeated filters remain valid. These checks are opt-in, so
 existing callers keep their parsing behavior. The module targets Go 1.23.
 
+For CRUD endpoints using `page_size` and `preload`, `binding.ParseListValues`
+returns a flat `model.ListQuery` with strict URL validation. Services may
+construct the same type directly and call `GeneratorQuery()` before passing it
+to `Scopes` or `CountScopes`. This list contract omits legacy raw filter/sort
+fields and filter groups; schema allow-lists and service-specific limits still
+belong to each service.
+
 ## Installation
 
 ```bash

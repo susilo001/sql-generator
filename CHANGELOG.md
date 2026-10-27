@@ -2,6 +2,10 @@
 
 All notable changes to sql-generator will be documented in this file.
 
+## [1.6.0] - 2026-10-27
+
+- Added a flat ListQuery contract and strict shared URL parser for CRUD list endpoints.
+
 ## [1.5.1] - 2026-10-27
 
 - Added opt-in strict URL clause validation without changing default parsing.
