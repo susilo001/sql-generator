@@ -39,7 +39,10 @@ The binding package accepts `field:value:operator` filters separated by `|`
 and repeated `filter` parameters. Set `URLParseOptions.StrictPagination` to
 reject explicitly empty or nonpositive page/page-size values. Direct Go zero
 pagination still selects the defaults. Custom query keys such as `page_size`
-and `preload` are supported. The module targets Go 1.23.
+and `preload` are supported. Set `URLParseOptions.StrictClauses` to reject
+empty filter, sort, field and preload clauses, as well as repeated single-value
+query parameters; repeated filters remain valid. These checks are opt-in, so
+existing callers keep their parsing behavior. The module targets Go 1.23.
 
 ## Installation
 

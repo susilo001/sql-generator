@@ -2,6 +2,10 @@
 
 All notable changes to sql-generator will be documented in this file.
 
+## [1.5.1] - 2026-10-27
+
+- Added opt-in strict URL clause validation without changing default parsing.
+
 ## [1.5.0] - 2026-10-26
 
 - Added opt-in strict query validation, typed filter values, bounded offsets,

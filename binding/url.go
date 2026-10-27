@@ -47,6 +47,8 @@ var DefaultOpAliases = map[string]model.Operator{
 type URLParseOptions struct {
 	// StrictPagination rejects explicitly supplied nonpositive or empty pagination.
 	StrictPagination bool
+	// StrictClauses rejects empty clauses and repeated single-value query parameters.
+	StrictClauses bool
 	// Separators
 	FilterSep    string // between filter clauses. Default "|"
 	FilterTriple string // inside a filter clause. Default ":"
@@ -156,6 +158,11 @@ func ParseValues(v url.Values, opts *URLParseOptions) (model.Query, error) {
 		opts = &URLParseOptions{}
 	}
 	opts.applyDefaults()
+	if opts.StrictClauses {
+		if err := validateStrictClauses(v, opts); err != nil {
+			return model.Query{}, err
+		}
+	}
 
 	q := model.Query{
 		Search: v.Get(opts.SearchKey),
@@ -206,6 +213,32 @@ func ParseValues(v url.Values, opts *URLParseOptions) (model.Query, error) {
 	}
 
 	return q, nil
+}
+
+func validateStrictClauses(values url.Values, opts *URLParseOptions) error {
+	for _, key := range []string{opts.SearchKey, opts.PageKey, opts.PageSizeKey, opts.SortKey, opts.FieldsKey, opts.PreloadsKey} {
+		if len(values[key]) > 1 {
+			return fmt.Errorf("binding: %s must be supplied once", key)
+		}
+	}
+	for _, field := range []struct {
+		key       string
+		separator string
+	}{
+		{opts.FilterKey, opts.FilterSep},
+		{opts.SortKey, opts.SortSep},
+		{opts.FieldsKey, opts.ListSep},
+		{opts.PreloadsKey, opts.ListSep},
+	} {
+		for _, value := range values[field.key] {
+			for _, clause := range strings.Split(value, field.separator) {
+				if strings.TrimSpace(clause) == "" {
+					return fmt.Errorf("binding: %s contains an empty clause", field.key)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // parseSorts splits raw on sep into individual "field:asc|desc" clauses and
